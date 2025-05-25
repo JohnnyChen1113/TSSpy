@@ -1,0 +1,49 @@
+{% set name = "tsspy" %}
+{% set version = "0.1.0" %}  # Update with your version
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/JohnnyChen1113/TSSpy/archive/v{{ version }}.tar.gz
+  sha256: # generate this with `sha256sum` or similar tool
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . --no-deps --ignore-installed -vv
+
+requirements:
+  host:
+    - python >=3.8
+    - pip
+    - setuptools
+  run:
+    - python >=3.8
+    - typer
+    - pysam
+    - pandas
+    - numpy
+    - biopython
+    - pybigwig
+
+test:
+  imports:
+    - TSSpy
+  commands:
+    - python -m TSSpy.main --help
+
+about:
+  home: https://github.com/JohnnyChen1113/TSSpy
+  license: MIT
+  summary: 'Python command-line tool for transcription start site (TSS) analysis'
+  description: |
+    TSSpy is a Python command-line tool designed for the analysis of 
+    transcription start site (TSS) data. Inspired by the TSSr (R/Bioconductor) 
+    package (https://github.com/Linlab-slu/TSSr)
+  dev_url: https://github.com/JohnnyChen1113/TSSpy
+
+extra:
+  recipe-maintainers:
+    - Johnny Chen
