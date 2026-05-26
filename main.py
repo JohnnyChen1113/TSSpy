@@ -42,7 +42,7 @@ from TSSpy import consensus_cluster
 from TSSpy import shape_cluster
 from TSSpy.correlation import correlation
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # Create main app
 app = typer.Typer(
