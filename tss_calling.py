@@ -18,7 +18,7 @@ import re
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-__version__ = "0.12.0"  # Strict TSSr parity: mirror TSSr's sum-all-CIGAR mapped_length
+__version__ = "0.13.0"  # --strict-tssr flag: true keeps v0.12.0 TSSr parity, false fixes two TSSr bugs
 
 app = typer.Typer(help=f"Extract TSS information from BAM files (v{__version__})")
 
@@ -41,90 +41,68 @@ def calculate_tssr_mapped_length(cigar_string: str) -> int:
     return sum(int(n) for n in numbers)
 
 
-def remove_g_mismatch_with_reference(read, fasta: pysam.FastaFile, chrom: str) -> int:
+def remove_g_mismatch_with_reference(read, fasta: pysam.FastaFile, chrom: str,
+                                     strict_tssr: bool = True) -> int:
     """
     Remove mismatched G at 5' end using reference genome sequence.
 
-    Implements TSSr algorithm:
-    - Plus strand: check if read starts with G and reference is not G
-    - Minus strand: check if read ends with C (complement of G) and reference at START is not G
-
-    In BAM format, minus strand reads are stored as reverse complement.
-    RNA 5' cap G appears as C at the END of query_sequence.
-
-    Args:
-        read: pysam AlignedSegment
-        fasta: pysam FastaFile for reference genome
-        chrom: chromosome name
-
-    Returns:
-        Adjusted TSS position (1-based)
+    Two modes via `strict_tssr`:
+      True  — bit-for-bit reproduction of TSSr 0.99.6 getTSS(). On minus strand
+              this uses TSSr's sum-all-CIGAR end (1bp past actual alignment for
+              insertion reads) and the iteration filter checks seq[0:i] (the
+              non-TSS end of the forward-orient seq). These are TSSr bugs that
+              TSSpy reproduces faithfully in this mode.
+      False — corrected behavior for biologically faithful TSS calls:
+              minus-strand end uses pysam.reference_end (true alignment end),
+              and the iteration filter checks seq[-i:] (the actual 5' end of
+              the cDNA in BAM forward orientation).
     """
     read_seq = read.query_sequence
     if not read_seq:
         return None
 
     if read.is_reverse:
-        # Strict TSSr-parity: end = BAM_POS_1based + sum(all CIGAR ints) - 1.
-        # TSSr counts I bases in mapped.length, so for insertion-containing reads
-        # this end is 1bp past the actual alignment. Reproducing this matches TSSr
-        # output bit-for-bit; biologically it shifts the minus-strand TSS upstream.
         read_len = len(read_seq)
-        pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
+        if strict_tssr:
+            # TSSr-parity: end = BAM_POS + sum(all CIGAR ints) - 1
+            pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
+        else:
+            # Corrected: true alignment end (reference-consuming CIGAR ops only)
+            pos = read.reference_end  # 0-based exclusive == 1-based end
 
-        # Minus strand G mismatch removal algorithm (following TSSr exactly):
-        #
-        # Key insight from R testing:
-        # 1. BAM stores minus strand reads in FORWARD strand direction (NOT reverse complement!)
-        # 2. TSSr uses resize(width=1, fix='start') which for minus strand returns END position
-        # 3. TSSr uses getSeq() which returns COMPLEMENT of reference for minus strand
-        # 4. TSSr checks if complement != 'G' (i.e., forward strand ref != 'C')
-        #
-        # Algorithm:
-        # 1. Check if seq[-1] == 'C' (last base, corresponds to END position)
-        # 2. Check reference at END position, get complement
-        # 3. If complement != 'G', it's a mismatch -> end -= 1
-        # 4. Iterate: check if seq[0:i] == 'CC...C' (first i bases are all C)
-
-        # Round 1: Check if last base is C
+        # Round 1: last base of forward-orient seq must be C (= complement of cDNA 5' G)
         last_base = read_seq[read_len - 1]
         if last_base != 'C':
             return pos
 
-        # Check reference at END position
-        # pos is pysam's reference_end (0-based exclusive), so the last aligned base is at pos - 1
-        ref_end_pos = pos - 1  # 0-based position of last aligned base
+        # Reference check at the current end position (1-based 'pos' → 0-based pos-1)
+        ref_end_pos = pos - 1
         try:
             ref_base = fasta.fetch(chrom, ref_end_pos, ref_end_pos + 1).upper()
         except:
             return pos
 
-        # TSSr's getSeq() returns complement for minus strand
-        # Check if complement != 'G' (i.e., forward strand ref != 'C')
         complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
         ref_base_complement = complement.get(ref_base, 'N')
 
         if ref_base_complement == 'G':
-            # Complement is G (i.e., ref is C), not a mismatch
             return pos
 
-        # Mismatch! Decrement TSS
         pos -= 1
 
-        # Iterative rounds: check for consecutive C at sequence START
-        # TSSr checks: substr(seq, start=1, stop=i) == paste(rep("C",i), collapse="")
-        # This checks if the FIRST i bases are all 'C'
+        # Iterative rounds: TSSr-parity checks seq[0:i] (wrong end, buggy);
+        # corrected checks seq[-i:] (the actual cDNA 5' i bases in forward orientation).
         i = 2
         while i <= read_len:
-            # Check if first i bases of sequence are all C
-            prefix = read_seq[0:i]
+            if strict_tssr:
+                prefix = read_seq[0:i]
+            else:
+                prefix = read_seq[-i:]
             expected = 'C' * i
             if prefix != expected:
                 break
 
-            # Check reference at NEW end position (pos has been decremented)
-            # The new end position is pos - 1 (0-based)
-            new_ref_pos = pos - 1  # 0-based
+            new_ref_pos = pos - 1
             try:
                 ref_base = fasta.fetch(chrom, new_ref_pos, new_ref_pos + 1).upper()
             except:
@@ -137,7 +115,6 @@ def remove_g_mismatch_with_reference(read, fasta: pysam.FastaFile, chrom: str) -
             pos -= 1
             i += 1
 
-            # Safety limit
             if i > 10:
                 break
 
@@ -180,7 +157,7 @@ def remove_g_mismatch_with_reference(read, fasta: pysam.FastaFile, chrom: str) -
         return pos + removed_count
 
 
-def get_tss_position_no_reference(read) -> tuple:
+def get_tss_position_no_reference(read, strict_tssr: bool = True) -> tuple:
     """
     Get TSS position when no reference is provided.
 
@@ -188,8 +165,10 @@ def get_tss_position_no_reference(read) -> tuple:
         (position, strand) tuple
     """
     if read.is_reverse:
-        # Strict TSSr-parity end: BAM_POS_1based + sum(CIGAR ints) - 1.
-        pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
+        if strict_tssr:
+            pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
+        else:
+            pos = read.reference_end  # true alignment end
         strand = "-"
     else:
         pos = read.reference_start + 1  # Convert to 1-based
@@ -202,7 +181,8 @@ def process_single_bam(bam_file: str,
                        sample_name: str,
                        sequencing_quality_threshold: int,
                        mapping_quality_threshold: int,
-                       reference_file: Optional[str] = None) -> pd.DataFrame:
+                       reference_file: Optional[str] = None,
+                       strict_tssr: bool = True) -> pd.DataFrame:
     """
     Process a single BAM file to extract TSS information.
     """
@@ -237,12 +217,12 @@ def process_single_bam(bam_file: str,
                 chrom = bam.get_reference_name(read.reference_id)
 
                 if fasta:
-                    pos = remove_g_mismatch_with_reference(read, fasta, chrom)
+                    pos = remove_g_mismatch_with_reference(read, fasta, chrom, strict_tssr=strict_tssr)
                     if pos is None:
                         continue
                     strand = "-" if read.is_reverse else "+"
                 else:
-                    pos, strand = get_tss_position_no_reference(read)
+                    pos, strand = get_tss_position_no_reference(read, strict_tssr=strict_tssr)
 
                 tss_dict[(chrom, pos, strand)] += 1
 
@@ -309,6 +289,18 @@ def main(
         "-p", "--processes",
         help="Number of processes (default: CPU cores - 1)",
     ),
+    strict_tssr: bool = typer.Option(
+        True,
+        "--strict-tssr/--no-strict-tssr",
+        help=(
+            "true (default): bit-for-bit reproduction of TSSr 0.99.6, including "
+            "two known TSSr bugs (sum-all-CIGAR mapped_length; minus-strand iteration "
+            "filter checking the wrong end of the read). "
+            "false: apply both corrections — minus-strand end uses true alignment "
+            "end and iteration checks the actual cDNA 5' bases. "
+            "Diverges from TSSr output but is biologically faithful."
+        ),
+    ),
     verbose: bool = typer.Option(
         False,
         "-v", "--verbose",
@@ -350,6 +342,7 @@ def main(
         print(f"G mismatch removal: enabled")
     else:
         print(f"G mismatch removal: disabled")
+    print(f"Mode: {'strict TSSr parity' if strict_tssr else 'CORRECTED (--no-strict-tssr)'}")
 
     if processes is None:
         processes = max(1, cpu_count() - 1)
@@ -357,7 +350,7 @@ def main(
     print(f"Using {processes} processes")
 
     args_list = [
-        (bam, name, sequencing_quality, mapping_quality, reference_str)
+        (bam, name, sequencing_quality, mapping_quality, reference_str, strict_tssr)
         for bam, name in zip(input_files_str, names_list)
     ]
 
