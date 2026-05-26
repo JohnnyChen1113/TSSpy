@@ -18,7 +18,7 @@ import re
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-__version__ = "0.11.0"  # Use reference_end for correct position (handles indels correctly)
+__version__ = "0.12.0"  # Strict TSSr parity: mirror TSSr's sum-all-CIGAR mapped_length
 
 app = typer.Typer(help=f"Extract TSS information from BAM files (v{__version__})")
 
@@ -65,13 +65,12 @@ def remove_g_mismatch_with_reference(read, fasta: pysam.FastaFile, chrom: str) -
         return None
 
     if read.is_reverse:
-        # Minus strand: TSS is at the "end" position (5' end of minus strand read)
-        # Use pysam's reference_end which correctly handles CIGAR operations:
-        # - M, D, N, =, X consume reference
-        # - I, S, H, P do NOT consume reference
-        # pysam's reference_end is 0-based exclusive, which equals the 1-based end position
+        # Strict TSSr-parity: end = BAM_POS_1based + sum(all CIGAR ints) - 1.
+        # TSSr counts I bases in mapped.length, so for insertion-containing reads
+        # this end is 1bp past the actual alignment. Reproducing this matches TSSr
+        # output bit-for-bit; biologically it shifts the minus-strand TSS upstream.
         read_len = len(read_seq)
-        pos = read.reference_end  # 0-based exclusive = 1-based end position
+        pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
 
         # Minus strand G mismatch removal algorithm (following TSSr exactly):
         #
@@ -189,8 +188,8 @@ def get_tss_position_no_reference(read) -> tuple:
         (position, strand) tuple
     """
     if read.is_reverse:
-        # Use reference_end (0-based exclusive = 1-based end position)
-        pos = read.reference_end
+        # Strict TSSr-parity end: BAM_POS_1based + sum(CIGAR ints) - 1.
+        pos = (read.reference_start + 1) + calculate_tssr_mapped_length(read.cigarstring) - 1
         strand = "-"
     else:
         pos = read.reference_start + 1  # Convert to 1-based
@@ -220,6 +219,11 @@ def process_single_bam(bam_file: str,
 
             for read in bam:
                 if read.is_unmapped:
+                    continue
+
+                # TSSr passes isNotPassingQualityControls=FALSE to scanBamFlag,
+                # which excludes reads with the BAM 0x200 (QC fail) bit set.
+                if read.is_qcfail:
                     continue
 
                 if read.mapping_quality < mapping_quality_threshold:
@@ -291,9 +295,9 @@ def main(
         help="Reference genome FASTA file (for G mismatch removal)",
     ),
     sequencing_quality: int = typer.Option(
-        20,
+        10,
         "--sequencing-quality",
-        help="Minimum sequencing quality threshold",
+        help="Minimum sequencing quality threshold (TSSr default: 10)",
     ),
     mapping_quality: int = typer.Option(
         20,
