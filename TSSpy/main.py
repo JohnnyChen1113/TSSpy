@@ -26,8 +26,7 @@ Commands:
     shapeCluster     - Calculate promoter shape scores (PSS/SI)
     geneAssign       - Assign clusters to genes
     bigwig           - Generate BigWig/BedGraph files
-    correlation      - Calculate sample correlations
-    plot             - Generate visualization plots
+    correlation      - Sample correlation matrix + R-pairs-style plot
 """
 
 import typer
@@ -35,14 +34,14 @@ import typer
 from TSSpy import tss_calling
 from TSSpy import clustering
 from TSSpy import gene_assign
-from TSSpy import plot
 from TSSpy import bigwig
 from TSSpy import merge_samples
 from TSSpy import consensus_cluster
 from TSSpy import shape_cluster
+from TSSpy import plot
 from TSSpy.correlation import correlation
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 # Create main app
 app = typer.Typer(
@@ -59,10 +58,10 @@ app.add_typer(consensus_cluster.app, name="consensusCluster", help="Consensus cl
 app.add_typer(shape_cluster.app, name="shapeCluster", help="Calculate promoter shape scores")
 app.add_typer(gene_assign.app, name="geneAssign", help="Assign clusters to genes")
 app.add_typer(bigwig.app, name="bigwig", help="Generate BigWig/BedGraph files")
-app.add_typer(plot.app, name="plot", help="Generate visualization plots")
+app.add_typer(plot.app, name="plot", help="Diagnostic plots (PCA, IQW, shape)")
 
 # Register correlation as a direct command
-app.command(name="correlation", help="Calculate sample correlations")(correlation)
+app.command(name="correlation", help="Sample correlation matrix + R-pairs-style plot")(correlation)
 
 
 @app.command()

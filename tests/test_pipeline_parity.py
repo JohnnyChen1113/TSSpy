@@ -291,3 +291,70 @@ def test_bedgraph_byte_for_byte(bedgraph_out, data_dir, sample, strand):
     r_bytes = r_path.read_bytes()
     p_bytes = p_path.read_bytes()
     assert r_bytes == p_bytes, f"{sample} {strand}: bedGraph differs by {len(r_bytes)-len(p_bytes):+d} bytes"
+
+
+# ---------- Auxiliary: plotnine-based plots ----------
+
+def test_plot_pca_smoke(workdir, data_dir):
+    out = workdir / "pca.pdf"
+    run_tsspy(
+        "plot", "pca",
+        "-i", str(data_dir / "tssr_repro_seqq10.TSS.tsv"),
+        "-o", str(out),
+        "--tss-threshold", "10",
+        "--merge-labels", "YPD Arrest",
+        "--merge-index", "1 1 2 2",
+    )
+    assert out.exists() and out.stat().st_size > 1_000
+
+
+def test_plot_iqw_smoke(workdir, data_dir):
+    out = workdir / "iqw.pdf"
+    run_tsspy(
+        "plot", "iqw",
+        "-i", str(data_dir / "tssr_stage5_consensus_YPD.tsv"),
+        "-i", str(data_dir / "tssr_stage5_consensus_Arrest.tsv"),
+        "-n", "YPD Arrest",
+        "-o", str(out),
+    )
+    assert out.exists() and out.stat().st_size > 1_000
+
+
+def test_plot_shape_smoke(workdir, data_dir):
+    out = workdir / "shape.pdf"
+    run_tsspy(
+        "plot", "shape",
+        "-i", str(data_dir / "tssr_stage6_shape_PSS_YPD.tsv"),
+        "-i", str(data_dir / "tssr_stage6_shape_PSS_Arrest.tsv"),
+        "-n", "YPD Arrest",
+        "-o", str(out),
+    )
+    assert out.exists() and out.stat().st_size > 1_000
+
+
+# ---------- Auxiliary: correlation ----------
+
+def test_correlation_smoke(workdir, data_dir):
+    """Smoke test: correlation CLI runs end-to-end and produces sensible Pearson
+    r values + plot file. Not a parity test (TSSr's plot is a PDF; we compare
+    against expected per-sample r values instead)."""
+    out_csv = workdir / "corr_matrix.csv"
+    out_png = workdir / "corr_pairs.png"
+    run_tsspy(
+        "correlation",
+        "-i", str(data_dir / "tssr_repro_seqq10.TSS.tsv"),
+        "-o", str(out_csv),
+        "--plot", "--plot-file", str(out_png),
+        "--source", "raw",
+    )
+    assert out_csv.exists()
+    assert out_png.exists() and out_png.stat().st_size > 10_000
+    m = pd.read_csv(out_csv, index_col=0)
+    assert list(m.columns) == ["YPD.1", "YPD.2", "Arrest.1", "Arrest.2"]
+    # Sanity: replicates correlate >0.98; cross-condition <1
+    assert m.loc["YPD.1", "YPD.2"] > 0.98
+    assert m.loc["Arrest.1", "Arrest.2"] > 0.98
+    assert m.loc["YPD.1", "Arrest.1"] < 0.97
+    # Diagonal must be 1
+    for s in m.columns:
+        assert abs(m.loc[s, s] - 1.0) < 1e-9
