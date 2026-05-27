@@ -1,351 +1,324 @@
 #!/usr/bin/env python3
 """
-Consensus Cluster - Aggregate tag clusters across samples into consensus clusters
+Cross-sample consensus clusters — strict parity with TSSr 0.99.6 consensusCluster().
+
+Mirrors:
+  TSSr::consensusCluster()        (ConsensusMethods.R)
+  TSSr::.getConsensus()           (ConsensusFunctions.R)
+  TSSr::.getConsensusQuantile()   (ConsensusFunctions.R)
+
+Algorithm:
+  Phase 1 — build consensus GRanges set across all samples
+    For each sample's tag clusters, construct fixed-width windows of
+    [dominant_tss - round(dis/2), dominant_tss + round(dis/2)] (both inclusive).
+    Sample 1: self-union (reduce) into disjoint ranges.
+    Sample i (i >= 2): findOverlaps with current consensus, then concatenate
+      union(overlap_pairs) + non-overlapping_from_1 + non-overlapping_from_2.
+    Sort by (strand, chr, start) and assign 1-based consensusCluster ID.
+
+  Phase 2 — per-sample quantile reconstruction
+    For each consensus range gr[x]:
+      Find this sample's tag clusters whose dominant_tss is in [gr.start, gr.end].
+      If any: pull this sample's TSS positions in [min(tc.start), max(tc.end)],
+              recompute tags-sum, dominant_tss, q_0.1, q_0.9, interquantile_width.
+      If none: omit this sample's row for this consensus cluster.
+    Sort per-sample output by (strand, chr, start).
 """
 
+from __future__ import annotations
 import typer
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Dict
 from pathlib import Path
+from typing import List, Optional, Dict, Tuple
 import logging
-from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-__version__ = "0.1.0"
+__version__ = "0.16.0"
+app = typer.Typer(help=f"Cross-sample consensus clustering (v{__version__})")
 
-app = typer.Typer(help=f"Consensus clustering across samples (v{__version__})")
+KEY_COLS = ['chr', 'pos', 'strand']
+OUTPUT_COLS = ['cluster', 'chr', 'start', 'end', 'strand',
+               'dominant_tss', 'tags', 'tags.dominant_tss',
+               'q_0.1', 'q_0.9', 'interquantile_width']
 
 
-def load_tag_clusters(cluster_files: List[str], sample_names: List[str]) -> Dict[str, pd.DataFrame]:
+# -----------------------------------------------------------------------------
+# GRanges-like primitives (per (chr, strand) stratification)
+# -----------------------------------------------------------------------------
+
+def _build_windows(tc: pd.DataFrame, dis: int) -> pd.DataFrame:
+    """Construct ±round(dis/2) windows centered on each tc's dominant_tss."""
+    half = int(round(dis / 2.0))  # banker's rounding matches R round()
+    out = tc[['chr', 'strand', 'dominant_tss']].copy()
+    out['start'] = out['dominant_tss'] - half
+    out['end'] = out['dominant_tss'] + half
+    return out[['chr', 'strand', 'start', 'end']]
+
+
+def _grange_reduce_per_strata(ranges: pd.DataFrame) -> pd.DataFrame:
     """
-    Load tag cluster files for multiple samples.
-
-    Args:
-        cluster_files: List of paths to cluster TSV files
-        sample_names: Corresponding sample names
-
-    Returns:
-        Dictionary mapping sample names to cluster DataFrames
+    Per (chr, strand): sort by start, merge ranges with gap <= 0
+    (overlapping or touching). Mirrors IRanges::reduce default behaviour
+    (min.gapwidth = 1L means merge when gap < 1, i.e. gap == 0 too).
     """
-    clusters = {}
-    for f, name in zip(cluster_files, sample_names):
-        df = pd.read_csv(f, sep='\t')
-        # Ensure required columns exist
-        required_cols = ['cluster', 'chr', 'start', 'end', 'strand', 'dominant_tss']
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            logger.warning(f"Sample {name}: missing columns {missing}")
-            continue
-        clusters[name] = df
-        logger.info(f"Loaded {len(df)} clusters for sample {name}")
-    return clusters
-
-
-def find_overlapping_clusters(clusters_dict: Dict[str, pd.DataFrame],
-                               dominant_distance: int = 50) -> pd.DataFrame:
-    """
-    Find consensus clusters by grouping clusters with nearby dominant TSS.
-
-    Clusters from different samples are considered to belong to the same
-    consensus cluster if their dominant TSS positions are within the
-    specified distance.
-
-    Args:
-        clusters_dict: Dictionary of sample -> cluster DataFrame
-        dominant_distance: Maximum distance between dominant TSS positions
-
-    Returns:
-        DataFrame with consensus cluster information
-    """
-    # Collect all clusters with their sample information
-    all_clusters = []
-    for sample, df in clusters_dict.items():
-        df_copy = df.copy()
-        df_copy['sample'] = sample
-        all_clusters.append(df_copy)
-
-    if not all_clusters:
-        return pd.DataFrame()
-
-    combined = pd.concat(all_clusters, ignore_index=True)
-
-    # Sort by chromosome, strand, and dominant TSS position
-    combined = combined.sort_values(['chr', 'strand', 'dominant_tss']).reset_index(drop=True)
-
-    # Assign consensus cluster IDs
-    consensus_id = 0
-    consensus_ids = []
-    prev_chr = None
-    prev_strand = None
-    prev_dom_tss = None
-
-    for idx, row in combined.iterrows():
-        chr_name = row['chr']
-        strand = row['strand']
-        dom_tss = row['dominant_tss']
-
-        # Check if this cluster belongs to a new consensus group
-        if (prev_chr != chr_name or
-            prev_strand != strand or
-            prev_dom_tss is None or
-            abs(dom_tss - prev_dom_tss) > dominant_distance):
-            consensus_id += 1
-
-        consensus_ids.append(consensus_id)
-        prev_chr = chr_name
-        prev_strand = strand
-        prev_dom_tss = dom_tss
-
-    combined['consensus_cluster'] = consensus_ids
-
-    return combined
-
-
-def aggregate_consensus_clusters(combined: pd.DataFrame,
-                                  sample_names: List[str]) -> pd.DataFrame:
-    """
-    Aggregate consensus cluster information across samples.
-
-    For each consensus cluster, compute:
-    - Combined boundaries (union of all sample boundaries)
-    - Dominant TSS (most common or highest signal)
-    - Signal statistics per sample
-
-    Args:
-        combined: DataFrame with consensus_cluster column
-        sample_names: List of sample names
-
-    Returns:
-        Aggregated consensus cluster DataFrame
-    """
-    results = []
-
-    for cc_id, group in combined.groupby('consensus_cluster'):
-        # Basic info (from first row, they should be similar)
-        chr_name = group['chr'].iloc[0]
-        strand = group['strand'].iloc[0]
-
-        # Combined boundaries
-        start = group['start'].min()
-        end = group['end'].max()
-
-        # Dominant TSS: use the position with highest total tags
-        if 'tags' in group.columns:
-            dom_idx = group['tags'].idxmax()
-            dominant_tss = group.loc[dom_idx, 'dominant_tss']
-        else:
-            # Use the median dominant TSS position
-            dominant_tss = int(group['dominant_tss'].median())
-
-        # Collect per-sample statistics
-        row = {
-            'consensus_cluster': cc_id,
-            'chr': chr_name,
-            'start': start,
-            'end': end,
-            'strand': strand,
-            'dominant_tss': dominant_tss,
-            'width': end - start + 1,
-            'n_samples': group['sample'].nunique(),
-        }
-
-        # Add sample-specific info
-        for sample in sample_names:
-            sample_data = group[group['sample'] == sample]
-            if len(sample_data) > 0:
-                row[f'{sample}.tags'] = sample_data['tags'].sum() if 'tags' in sample_data.columns else 0
-                row[f'{sample}.dominant_tss'] = sample_data['dominant_tss'].iloc[0]
+    if ranges.empty:
+        return ranges.copy()
+    out = []
+    for (c, s), grp in ranges.groupby(['chr', 'strand'], sort=False):
+        grp_sorted = grp.sort_values('start').reset_index(drop=True)
+        cur_start = int(grp_sorted.at[0, 'start'])
+        cur_end = int(grp_sorted.at[0, 'end'])
+        for i in range(1, len(grp_sorted)):
+            s_i = int(grp_sorted.at[i, 'start'])
+            e_i = int(grp_sorted.at[i, 'end'])
+            if s_i <= cur_end + 1:  # overlap or touching => merge
+                cur_end = max(cur_end, e_i)
             else:
-                row[f'{sample}.tags'] = 0
-                row[f'{sample}.dominant_tss'] = np.nan
-
-        results.append(row)
-
-    return pd.DataFrame(results)
+                out.append((c, s, cur_start, cur_end))
+                cur_start, cur_end = s_i, e_i
+        out.append((c, s, cur_start, cur_end))
+    return pd.DataFrame(out, columns=['chr', 'strand', 'start', 'end'])
 
 
-def compute_consensus_from_tss_table(tss_df: pd.DataFrame,
-                                      clustered_dfs: Dict[str, pd.DataFrame],
-                                      dominant_distance: int = 50) -> pd.DataFrame:
+def _find_overlaps(gr1: pd.DataFrame, gr2: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Alternative approach: create consensus clusters directly from TSS table
-    by finding regions where multiple samples have clusters.
-
-    Args:
-        tss_df: Raw TSS table
-        clustered_dfs: Per-sample clustered data
-        dominant_distance: Distance threshold for merging
-
-    Returns:
-        Consensus cluster DataFrame with per-sample tags
+    Per (chr, strand): return (query_idx, subject_idx) arrays of overlapping pairs.
+    Inclusive overlap: ranges [a,b] and [c,d] overlap iff max(a,c) <= min(b,d).
     """
-    # Find consensus clusters
-    combined = find_overlapping_clusters(clustered_dfs, dominant_distance)
+    if gr1.empty or gr2.empty:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
 
-    if combined.empty:
-        return pd.DataFrame()
+    q_idx_list = []
+    s_idx_list = []
+    # Group both gr1 and gr2 by (chr, strand) to do O(N+M) sweep within strata.
+    gr1 = gr1.reset_index(drop=False).rename(columns={'index': '_q'})
+    gr2 = gr2.reset_index(drop=False).rename(columns={'index': '_s'})
 
-    sample_names = list(clustered_dfs.keys())
-    consensus_df = aggregate_consensus_clusters(combined, sample_names)
+    g1 = {k: v for k, v in gr1.groupby(['chr', 'strand'], sort=False)}
+    g2 = {k: v for k, v in gr2.groupby(['chr', 'strand'], sort=False)}
 
-    return consensus_df
+    for key in g1:
+        if key not in g2:
+            continue
+        a = g1[key].sort_values('start').reset_index(drop=True)
+        b = g2[key].sort_values('start').reset_index(drop=True)
+        # For each query in a, find subjects in b that overlap. Naive O(N*M) is fine
+        # for the cluster-window sizes we deal with (thousands per strand max).
+        a_starts = a['start'].values
+        a_ends = a['end'].values
+        b_starts = b['start'].values
+        b_ends = b['end'].values
+        a_qs = a['_q'].values
+        b_ss = b['_s'].values
+        for i in range(len(a)):
+            s_a, e_a = a_starts[i], a_ends[i]
+            # overlap: b.start <= e_a AND b.end >= s_a
+            hits = np.where((b_starts <= e_a) & (b_ends >= s_a))[0]
+            if len(hits) == 0:
+                continue
+            for h in hits:
+                q_idx_list.append(int(a_qs[i]))
+                s_idx_list.append(int(b_ss[h]))
+    return np.array(q_idx_list, dtype=np.int64), np.array(s_idx_list, dtype=np.int64)
 
+
+def _build_consensus_set(per_sample_tc: List[pd.DataFrame], dis: int) -> pd.DataFrame:
+    """
+    Build the cross-sample consensus GRanges set following TSSr's algorithm:
+      gr <- union(gr1, gr1)
+      for i in 2..N: gr <- .getConsensus(gr, cs[[i]], dis)
+    The final set is NOT yet sorted or assigned IDs.
+    """
+    if not per_sample_tc:
+        return pd.DataFrame(columns=['chr', 'strand', 'start', 'end'])
+
+    # Sample 1: window construction + self-union (reduce)
+    gr = _grange_reduce_per_strata(_build_windows(per_sample_tc[0], dis))
+
+    for i in range(1, len(per_sample_tc)):
+        gr2 = _build_windows(per_sample_tc[i], dis)
+        q_idx, s_idx = _find_overlaps(gr, gr2)
+        # union(gr[hit_q], gr2[hit_s])  -- with duplicates absorbed by reduce
+        if len(q_idx) > 0:
+            hit_q_unique = np.unique(q_idx)
+            hit_s_unique = np.unique(s_idx)
+            combined_hits = pd.concat([
+                gr.iloc[hit_q_unique].assign(),
+                gr2.iloc[hit_s_unique].assign(),
+            ], ignore_index=True)
+            unioned = _grange_reduce_per_strata(combined_hits)
+        else:
+            unioned = pd.DataFrame(columns=['chr', 'strand', 'start', 'end'])
+            hit_q_unique = np.array([], dtype=np.int64)
+            hit_s_unique = np.array([], dtype=np.int64)
+        # gr[-hit_q] + gr2[-hit_s]
+        non_hit_q = gr.drop(index=hit_q_unique) if len(hit_q_unique) else gr
+        non_hit_s = gr2.drop(index=hit_s_unique) if len(hit_s_unique) else gr2
+        gr = pd.concat([unioned, non_hit_q, non_hit_s], ignore_index=True)
+    return gr
+
+
+# -----------------------------------------------------------------------------
+# Phase 2: per-sample quantile reconstruction
+# -----------------------------------------------------------------------------
+
+def _consensus_quantile_for_sample(consensus: pd.DataFrame,
+                                   tc: pd.DataFrame,
+                                   tss_sample: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each consensus range, find sample's tcs whose dominant_tss lies in it.
+    If any, pull TSS positions in [min(tc.start), max(tc.end)] and recompute stats.
+    `tss_sample` is the sample's TSS table (chr, pos, strand, tags) filtered to tags > 0.
+    """
+    # Pre-index tc and tss for fast (chr, strand) lookup
+    tc_by_cs = {k: v.sort_values('dominant_tss').reset_index(drop=True)
+                for k, v in tc.groupby(['chr', 'strand'], sort=False)}
+    tss_by_cs = {k: v.sort_values('pos').reset_index(drop=True)
+                 for k, v in tss_sample.groupby(['chr', 'strand'], sort=False)}
+
+    rows = []
+    for cid, c_chr, c_strand, c_start, c_end in zip(
+            consensus['consensusCluster'].values,
+            consensus['chr'].values,
+            consensus['strand'].values,
+            consensus['start'].values,
+            consensus['end'].values):
+        key = (c_chr, c_strand)
+        tc_grp = tc_by_cs.get(key)
+        if tc_grp is None:
+            continue
+        # tc rows with dominant_tss in [c_start, c_end]
+        mask = (tc_grp['dominant_tss'] >= c_start) & (tc_grp['dominant_tss'] <= c_end)
+        temp = tc_grp[mask]
+        if temp.empty:
+            continue
+        span_start = int(temp['start'].min())
+        span_end = int(temp['end'].max())
+
+        tss_grp = tss_by_cs.get(key)
+        if tss_grp is None:
+            continue
+        s = tss_grp[(tss_grp['pos'] >= span_start) & (tss_grp['pos'] <= span_end)]
+        if s.empty:
+            continue
+        s = s.sort_values('pos').reset_index(drop=True)
+
+        # Integer-scaled tags (TPM rounded to 6 decimals -> scale by 1e6)
+        tags_scaled = np.round(s['tags'].values * 1_000_000).astype(np.int64)
+        total_scaled = int(tags_scaled.sum())
+        tags_sum = total_scaled / 1_000_000.0
+
+        # dominant_tss = pos of first max-tag row
+        dom_idx = int(s['tags'].idxmax())
+        dominant_tss = int(s.at[dom_idx, 'pos'])
+        tags_dom = float(s.at[dom_idx, 'tags'])
+
+        fwd = tags_scaled.cumsum()
+        q1_idx = np.where(fwd * 10 > total_scaled)[0]
+        q1 = int(s.at[int(q1_idx[0]), 'pos']) if len(q1_idx) else None
+
+        rev = tags_scaled[::-1].cumsum()[::-1]
+        q9_idx = np.where(rev * 10 > total_scaled)[0]
+        q9 = int(s.at[int(q9_idx[-1]), 'pos']) if len(q9_idx) else None
+
+        iqw = (q9 - q1 + 1) if (q1 is not None and q9 is not None) else 0
+
+        rows.append({
+            'cluster': int(cid),
+            'chr': c_chr,
+            'start': int(s['pos'].min()),
+            'end': int(s['pos'].max()),
+            'strand': c_strand,
+            'dominant_tss': dominant_tss,
+            'tags': tags_sum,
+            'tags.dominant_tss': tags_dom,
+            'q_0.1': q1,
+            'q_0.9': q9,
+            'interquantile_width': iqw,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=OUTPUT_COLS)
+    df = pd.DataFrame(rows)
+    df = df.sort_values(['strand', 'chr', 'start']).reset_index(drop=True)
+    return df[OUTPUT_COLS]
+
+
+# -----------------------------------------------------------------------------
+# Driver
+# -----------------------------------------------------------------------------
+
+def consensus_cluster(tss_df: pd.DataFrame,
+                      per_sample_tc: Dict[str, pd.DataFrame],
+                      dis: int = 50) -> Dict[str, pd.DataFrame]:
+    """
+    Run the full TSSr-style consensusCluster pipeline.
+    Returns dict mapping sample name -> per-sample consensus DataFrame.
+    """
+    sample_order = list(per_sample_tc.keys())
+    tc_list = [per_sample_tc[s] for s in sample_order]
+
+    # Phase 1: cross-sample consensus
+    gr = _build_consensus_set(tc_list, dis)
+    if gr.empty:
+        return {s: pd.DataFrame(columns=OUTPUT_COLS) for s in sample_order}
+
+    gr = gr.sort_values(['strand', 'chr', 'start']).reset_index(drop=True)
+    gr['consensusCluster'] = np.arange(1, len(gr) + 1, dtype=np.int64)
+
+    # Phase 2: per-sample quantiles
+    out: Dict[str, pd.DataFrame] = {}
+    for s in sample_order:
+        tc = per_sample_tc[s]
+        tss_sample = tss_df[KEY_COLS + [s]].rename(columns={s: 'tags'}).copy()
+        tss_sample = tss_sample[tss_sample['tags'] > 0]
+        out[s] = _consensus_quantile_for_sample(gr, tc, tss_sample)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 
 @app.command("cluster")
-def consensus_cluster_command(
-    input_files: List[Path] = typer.Option(
-        ..., "-i", "--input",
-        help="Input tag cluster files (one per sample)"
-    ),
-    sample_names: str = typer.Option(
-        ..., "-n", "--sample-names",
-        help="Sample names (space-separated)"
-    ),
-    output_file: Path = typer.Option(
-        ..., "-o", "--output",
-        help="Output consensus cluster file"
-    ),
-    distance: int = typer.Option(
-        50, "-d", "--distance",
-        help="Maximum distance between dominant TSS positions to merge clusters"
-    ),
+def cluster_command(
+    tss_input: Path = typer.Option(..., "-t", "--tss-input",
+                                   help="Filtered TSS table from filterTSS"),
+    cluster_inputs: List[Path] = typer.Option(..., "-i", "--input-clusters",
+                                              help="Per-sample tag-cluster TSV files"),
+    sample_names: str = typer.Option(..., "-n", "--sample-names",
+                                     help='Sample names, space-separated; '
+                                          'must match cluster file order AND a column in --tss-input'),
+    output_prefix: Path = typer.Option(..., "-o", "--output-prefix",
+                                       help="Output prefix; one file per sample"),
+    dis: int = typer.Option(50, "-d", "--dis",
+                            help="Window width around each dominant_tss; "
+                                 "consensus uses ±round(dis/2). Default 50."),
 ):
-    """
-    Create consensus clusters from per-sample tag clusters.
-
-    Example:
-        tsspy consensusCluster cluster \\
-            -i control.clusters.tsv -i treat.clusters.tsv \\
-            -n "control treat" -o consensus.tsv -d 50
-    """
-    names_list = sample_names.split()
-    files_list = [str(f) for f in input_files]
-
-    if len(names_list) != len(files_list):
+    """Cross-sample consensus clusters (TSSr consensusCluster, dis=50 default)."""
+    names = sample_names.split()
+    if len(names) != len(cluster_inputs):
         raise typer.BadParameter(
-            f"Number of sample names ({len(names_list)}) must match number of input files ({len(files_list)})"
-        )
+            f"sample-names count ({len(names)}) != cluster files count ({len(cluster_inputs)})")
 
-    logger.info(f"Loading {len(files_list)} cluster files")
+    tss_df = pd.read_csv(tss_input, sep='\t')
+    missing = [n for n in names if n not in tss_df.columns]
+    if missing:
+        raise typer.BadParameter(f"sample columns not found in TSS table: {missing}")
 
-    # Load cluster files
-    clusters_dict = load_tag_clusters(files_list, names_list)
+    per_sample_tc: Dict[str, pd.DataFrame] = {}
+    for n, p in zip(names, cluster_inputs):
+        per_sample_tc[n] = pd.read_csv(p, sep='\t')
+        logger.info(f"loaded {n}: {len(per_sample_tc[n])} tag clusters")
 
-    if not clusters_dict:
-        logger.error("No valid cluster files loaded")
-        raise typer.Exit(1)
-
-    # Find consensus clusters
-    logger.info(f"Finding consensus clusters (distance threshold: {distance} bp)")
-    combined = find_overlapping_clusters(clusters_dict, distance)
-
-    if combined.empty:
-        logger.error("No clusters found")
-        raise typer.Exit(1)
-
-    # Aggregate
-    consensus_df = aggregate_consensus_clusters(combined, names_list)
-
-    # Save
-    consensus_df.to_csv(output_file, sep='\t', index=False)
-    logger.info(f"Saved {len(consensus_df)} consensus clusters to {output_file}")
-
-
-@app.command("from-tss")
-def consensus_from_tss_command(
-    tss_input: Path = typer.Option(
-        ..., "-t", "--tss-input",
-        help="Input TSS table (merged/normalized)"
-    ),
-    output_file: Path = typer.Option(
-        ..., "-o", "--output",
-        help="Output consensus cluster file"
-    ),
-    peak_distance: int = typer.Option(
-        100, "--peak-distance",
-        help="Minimum distance between peaks for clustering"
-    ),
-    extension_distance: int = typer.Option(
-        30, "--extension-distance",
-        help="Cluster boundary extension distance"
-    ),
-    local_threshold: float = typer.Option(
-        0.02, "--local-threshold",
-        help="Local filtering threshold (fraction of peak TPM)"
-    ),
-    cluster_threshold: float = typer.Option(
-        1.0, "--cluster-threshold",
-        help="Minimum cluster TPM threshold"
-    ),
-    consensus_distance: int = typer.Option(
-        50, "--consensus-distance",
-        help="Distance threshold for consensus clustering"
-    ),
-):
-    """
-    Cluster each sample and then create consensus clusters.
-
-    This performs per-sample clustering followed by consensus aggregation.
-
-    Example:
-        tsspy consensusCluster from-tss -t normalized.tsv -o consensus.tsv
-    """
-    from TSSpy.clustering import cluster_by_peak
-
-    logger.info(f"Reading TSS table: {tss_input}")
-    df = pd.read_csv(tss_input, sep='\t')
-
-    sample_cols = [c for c in df.columns if c not in ['chr', 'pos', 'strand']]
-    logger.info(f"Samples: {sample_cols}")
-
-    # Cluster each sample
-    all_clusters = {}
-
-    for sample in sample_cols:
-        logger.info(f"Clustering sample: {sample}")
-
-        # Calculate TPM for this sample
-        total = df[sample].sum()
-        if total == 0:
-            logger.warning(f"Sample {sample} has zero total counts, skipping")
-            continue
-
-        sample_df = df[['chr', 'pos', 'strand', sample]].copy()
-        sample_df['TPM'] = sample_df[sample] / total * 1e6
-        sample_df = sample_df[sample_df['TPM'] > 0]
-
-        # Cluster by chromosome and strand
-        sample_clusters = []
-        for (chr_name, strand), group in sample_df.groupby(['chr', 'strand']):
-            group = group.sort_values('pos').reset_index(drop=True)
-            clusters = cluster_by_peak(
-                group, peak_distance, local_threshold,
-                extension_distance, sample, cluster_threshold
-            )
-            if clusters is not None and not clusters.empty:
-                clusters['chr'] = chr_name
-                clusters['strand'] = strand
-                sample_clusters.append(clusters)
-
-        if sample_clusters:
-            all_clusters[sample] = pd.concat(sample_clusters, ignore_index=True)
-            logger.info(f"Sample {sample}: {len(all_clusters[sample])} clusters")
-
-    if not all_clusters:
-        logger.error("No clusters found for any sample")
-        raise typer.Exit(1)
-
-    # Create consensus clusters
-    logger.info(f"Creating consensus clusters (distance: {consensus_distance} bp)")
-    combined = find_overlapping_clusters(all_clusters, consensus_distance)
-    consensus_df = aggregate_consensus_clusters(combined, sample_cols)
-
-    # Save
-    consensus_df.to_csv(output_file, sep='\t', index=False)
-    logger.info(f"Saved {len(consensus_df)} consensus clusters to {output_file}")
+    out_per_sample = consensus_cluster(tss_df, per_sample_tc, dis=dis)
+    for s, df in out_per_sample.items():
+        out_path = Path(f"{output_prefix}.{s}.tsv")
+        df.to_csv(out_path, sep='\t', index=False)
+        logger.info(f"{s}: {len(df)} consensus rows -> {out_path}")
 
 
 if __name__ == '__main__':
