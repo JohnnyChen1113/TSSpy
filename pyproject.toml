@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsspy"
+dynamic = ["version"]
+description = "Python CLI for TSS analysis — bit-for-bit port of TSSr 0.99.6 without BSgenome"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Johnny Chen", email = "dailylifecjh@gmail.com"},
+]
+keywords = ["TSS", "transcription start site", "CAGE", "bioinformatics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "typer>=0.9",
+    "pysam>=0.21",
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "biopython>=1.79",
+    "pyBigWig>=0.3.18",
+    "matplotlib>=3.5",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/JohnnyChen1113/TSSpy"
+Repository = "https://github.com/JohnnyChen1113/TSSpy"
+Issues = "https://github.com/JohnnyChen1113/TSSpy/issues"
+
+[project.scripts]
+tsspy = "TSSpy.main:main"
+
+[tool.setuptools.packages.find]
+include = ["TSSpy*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "TSSpy.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"

@@ -1,227 +1,116 @@
-# TSSpy: Python CLI for TSS Analysis
+# TSSpy
 
-TSSpy is a Python command-line tool designed for the analysis of transcription start site (TSS) data. Inspired by [TSSr](https://github.com/Linlab-slu/TSSr) (R/Bioconductor) but implemented in pure Python **without BSgenome dependency**.
+**A Python CLI for transcription-start-site (TSS) analysis — bit-for-bit port of [TSSr](https://github.com/Linlab-slu/TSSr) 0.99.6, without the BSgenome dependency.**
 
-## Features
+TSSpy reproduces TSSr's full pipeline (`getTSS` → `mergeSamples` → `normalizeTSS` → `filterTSS` → `clusterTSS` → `consensusCluster` → `shapeCluster` → `annotateCluster` → `exportTSStoBedgraph`) in Python with `pysam` instead of Rsamtools/BSgenome.
 
-- **TSS Calling**: Extract TSS from BAM files with reference-based G mismatch removal
-- **Sample Merging**: Merge biological replicates and normalize to TPM
-- **TSS Clustering**: Cluster TSS to infer core promoters (peakclu algorithm)
-- **Consensus Clustering**: Cross-sample consensus cluster aggregation
-- **Promoter Shape Analysis**: Calculate PSS (Promoter Shape Score) and SI (Shape Index)
-- **Gene Assignment**: Assign clusters to genes using GTF/GFF annotations
-- **Visualization**: BigWig/BedGraph export, correlation plots
-- **Multi-processing**: Parallel processing support for large datasets
-- **Clean CLI**: Main-command + subcommand structure for modularity
+## Parity guarantee
 
-## Installation
+Every stage is regression-tested against TSSr 0.99.6 output on the 4-BAM yeast validation set:
 
-### Using pip (recommended)
+| Stage | Parity |
+|---|---|
+| `tssCalling` | bit-for-bit (163,203 TSS positions, all counts) |
+| `mergeSamples` / `normalize` / `filter` | bit-for-bit (TPM, poisson + TPM filters) |
+| `clustering` (peakclu + peakcluMax) | bit-for-bit, including `peakcluMax` from the `adamZhang_TSSr` fork |
+| `consensusCluster` | bit-for-bit |
+| `shapeCluster` (PSS + SI) | within FP precision (max\|Δ\| < 1e-12, non-score columns exact) |
+| `geneAssign` | bit-for-bit, including standalone GFF3 parser |
+| `bigwig` (bedGraph + BigWig) | byte-for-byte (bedGraph) / interval-for-interval (BigWig) |
 
-```bash
-pip install tsspy
-```
+Run `pytest tests/` to verify (requires the BAM + GFF + TSSr-derived ground-truth files in the working dir; ~94s).
 
-### Using conda
+## Two correctness modes
 
-```bash
-conda create -n tsspy python=3.8
-conda activate tsspy
-conda install -c bioconda -c conda-forge tsspy
-```
+The default `--strict-tssr` mode (= `true`) reproduces TSSr 0.99.6 exactly, including two known minus-strand bugs (see `TSSr_fix_proposal.md` for advisor write-up):
 
-### From source
+1. `mapped.length` overcounts insertion (I) operations → minus-strand TSS shifted 1bp past the actual alignment end for ~6,857 insertion-containing reads (S288C 4-BAM).
+2. G-mismatch iteration filter checks `seq[1..i]` (the cDNA 3' end on minus strand) instead of the cDNA 5' bases — affects ~104K reads.
+
+Pass `--no-strict-tssr` to apply the corrected algorithms. Validated YR motif uplift:
+
+| Dataset | Read-weighted YR rate (minus strand) |
+|---|---|
+| S288C 4-BAM | 82.69% → 84.77% (+2.08 pp) |
+| S. uvarum 2-BAM | 49.91% → 53.64% (+3.72 pp) |
+
+## Install
 
 ```bash
 git clone https://github.com/JohnnyChen1113/TSSpy.git
-cd TSSpy/TSSpy
+cd TSSpy
 pip install -e .
 ```
 
-## Dependencies
+This installs the `tsspy` console script and registers the `TSSpy` package.
 
-- Python >= 3.8
-- typer
-- pysam
-- pandas
-- numpy
-- biopython
-- pyBigWig
-- matplotlib
-- scipy (for correlation plots)
+Dependencies (auto-installed): `typer`, `pysam`, `pandas`, `numpy`, `biopython`, `pyBigWig`, `matplotlib`, `scipy`.
 
-## Quick Start
-
-### Command Structure
+## Quick start
 
 ```bash
-tsspy <command> [subcommand] [options]
+# 1. Call TSSs from BAMs (TSSr-strict by default)
+tsspy tssCalling \
+  -i sample1.bam -i sample2.bam -n "ctrl treat" \
+  -r genome.fasta -o raw.TSS.tsv
+
+# 2. Merge replicates + filter
+tsspy mergeSamples merge      -i raw.TSS.tsv      -o merged.tsv -g "ctrl treat" -m "1 1 2 2"
+tsspy mergeSamples filter     -i merged.tsv       -o filt.tsv   --method poisson --p-val 0.01 -r genome.fasta --normalization
+# (or all-in-one)
+tsspy mergeSamples process    -i raw.TSS.tsv      -o final.tsv  -g "ctrl treat" -m "1 1 2 2" --filter poisson -r genome.fasta
+
+# 3. Cluster
+tsspy clustering              -i filt.tsv         -o clusters --method peakclu
+tsspy clustering              -i filt.tsv         -o clusters --method peakcluMax  # adamZhang fork extension
+
+# 4. Cross-sample consensus
+tsspy consensusCluster cluster -t filt.tsv \
+  -i clusters.ctrl.tsv -i clusters.treat.tsv -n "ctrl treat" \
+  -o consensus -d 50
+
+# 5. Shape scores
+tsspy shapeCluster batch \
+  -c consensus.ctrl.tsv -c consensus.treat.tsv -n "ctrl treat" \
+  -t filt.tsv -o shape -m PSS
+
+# 6. Assign to genes
+tsspy geneAssign assign \
+  -c consensus.ctrl.tsv -c consensus.treat.tsv -n "ctrl treat" \
+  -a annotation.gff -o assigned
+
+# 7. Export to bedGraph / BigWig
+tsspy bigwig -i filt.tsv --format bedGraph --batch --data-label processed
+tsspy bigwig -i filt.tsv --format BigWig   --batch --data-label processed -r genome.fasta
 ```
 
-### Available Commands
-
-| Command | Description |
-|---------|-------------|
-| `tssCalling` | Extract TSS from BAM files |
-| `mergeSamples` | Merge samples and normalize data |
-| `clustering` | Cluster TSS to infer core promoters |
-| `consensusCluster` | Create consensus clusters across samples |
-| `shapeCluster` | Calculate promoter shape scores (PSS/SI) |
-| `geneAssign` | Assign clusters to genes |
-| `bigwig` | Generate BigWig/BedGraph files |
-| `correlation` | Calculate sample correlations |
-| `plot` | Generate visualization plots |
-
-## Workflow Example
-
-### 1. TSS Calling from BAM files
+## Two filter methods (matching TSSr)
 
 ```bash
-# Basic usage (soft-clipping mode)
-tsspy tssCalling main -i S01.bam -i S02.bam -o raw.TSS.tsv -n "sample1 sample2"
+# Poisson noise filter (needs raw counts; threshold derived from coverage)
+tsspy mergeSamples filter -i merged.tsv -o filt.tsv \
+  --method poisson --p-val 0.01 -r genome.fasta --normalization
 
-# With reference genome (G mismatch removal enabled)
-tsspy tssCalling main -i S01.bam -i S02.bam -o raw.TSS.tsv \
-    -n "sample1 sample2" -r reference.fa
-```
-
-### 2. Merge Samples and Normalize
-
-```bash
-# Merge biological replicates
-tsspy mergeSamples merge -i raw.TSS.tsv -o merged.TSS.tsv \
-    -g "control treat" -m "1 1 2 2"
-
-# Normalize to TPM
-tsspy mergeSamples normalize -i merged.TSS.tsv -o normalized.TSS.tsv
-
-# One-step processing (merge + normalize + filter)
-tsspy mergeSamples process -i raw.TSS.tsv -o processed.TSS.tsv \
-    -g "control treat" -m "1 1 2 2" \
-    --normalize --filter tpm --filter-threshold 0.1
-```
-
-### 3. TSS Clustering
-
-```bash
-tsspy clustering main -i processed.TSS.tsv -o clusters.tsv -s control \
-    --peak-distance 100 --extension-distance 30 --cluster-threshold 1
-```
-
-### 4. Consensus Clustering
-
-```bash
-# From per-sample cluster files
-tsspy consensusCluster cluster \
-    -i control.clusters.tsv -i treat.clusters.tsv \
-    -n "control treat" -o consensus.tsv -d 50
-
-# Directly from TSS table
-tsspy consensusCluster from-tss -t processed.TSS.tsv -o consensus.tsv
-```
-
-### 5. Promoter Shape Analysis (PSS)
-
-```bash
-# Calculate PSS for a sample
-tsspy shapeCluster calculate -c clusters.tsv -t processed.TSS.tsv \
-    -o shape.tsv -s control -m PSS
-
-# Calculate for all samples
-tsspy shapeCluster batch -c clusters.tsv -t processed.TSS.tsv \
-    -o shape -m PSS
-
-# Classify promoters as sharp/broad
-tsspy shapeCluster classify -i shape.tsv -o classified.tsv -m PSS
-```
-
-### 6. Gene Assignment
-
-```bash
-# Assign clusters to genes
-tsspy geneAssign assign -c clusters.tsv -a annotation.gtf \
-    -o assigned.tsv --upstream 1000
-
-# Create gene-level summary
-tsspy geneAssign summary -i assigned.tsv -o gene_summary.tsv
-
-# Filter to primary promoters only
-tsspy geneAssign filter -i assigned.tsv -o primary.tsv --keep-primary
-```
-
-### 7. Generate BigWig Files
-
-```bash
-tsspy bigwig -i processed.TSS.tsv -o output_prefix \
-    --format bigwig --reference genome.fa --process
-```
-
-### 8. Correlation Analysis
-
-```bash
-tsspy correlation -i processed.TSS.tsv -o correlation.csv --plot
-```
-
-## Shape Score Methods
-
-### PSS (Promoter Shape Score)
-- **Formula**: `PSS = -sum(p_i * log2(p_i)) * log2(IQW)`
-- Lower PSS = sharper promoter
-- PSS = 0 for singletons
-- Reference: Lu and Lin 2019
-
-### SI (Shape Index)
-- **Formula**: `SI = 2 + sum(p_i * log2(p_i))`
-- Higher SI = sharper promoter
-- SI = 2 for singletons
-- Reference: Hoskins et al. 2011
-
-## G Mismatch Removal
-
-When using CAGE data, the 5' end of reads may contain non-coded G bases (m7G cap). TSSpy can remove these mismatched G bases using a reference genome:
-
-```bash
-tsspy tssCalling main -i sample.bam -o output.tsv -r reference.fa
-```
-
-This requires:
-1. Reference FASTA file (with index `.fai`)
-2. `--allow-softclipping` must NOT be set
-
-## Output Formats
-
-### TSS Table
-```
-chr    pos    strand    sample1    sample2    ...
-chrI   1000   +         10         15
-chrI   1050   +         5          8
-```
-
-### Cluster Table
-```
-cluster  chr   start  end   strand  dominant_tss  tags  tags_TPM  q_0.1  q_0.9  interquantile_width
-1        chrI  1000   1100  +       1050          100   50.5      1010   1080   71
+# TPM threshold (needs normalized input)
+tsspy mergeSamples filter -i normalized.tsv -o filt.tsv \
+  --method TPM --tpm-low 0.1
 ```
 
 ## Differences from TSSr
 
-| Feature | TSSr (R) | TSSpy (Python) |
-|---------|----------|----------------|
-| Reference genome | BSgenome package required | FASTA file (pysam) |
-| BAM processing | Rsamtools | pysam |
+| | TSSr (R) | TSSpy |
+|---|---|---|
+| BAM I/O | Rsamtools | pysam (read-by-read iterator + multiprocessing) |
+| Reference genome | BSgenome (installed package per genome) | FASTA + `.fai` |
 | BigWig export | rtracklayer | pyBigWig |
-| CLI framework | R functions | typer (modern CLI) |
-| Parallelization | parallel (R) | multiprocessing (Python) |
-
-## Contributing
-
-Contributions, issues, and feature requests are welcome!
+| CLI | R functions | `tsspy <command>` (typer-based) |
+| Output values | matches TSSr exactly (in default mode) | matches TSSr bit-for-bit |
 
 ## Citation
 
-If you use TSSpy, please cite:
+If you use TSSpy, please cite TSSr alongside:
 - TSSpy: https://github.com/JohnnyChen1113/TSSpy
-- TSSr: Lu, Z., Berry, K., Hu, Z., Zhan, Y., Ahn, T., & Lin, Z. (2021). TSSr: an R package for comprehensive analyses of TSS sequencing data. NAR Genomics and Bioinformatics, 3(4).
+- TSSr: Lu, Z., Berry, K., Hu, Z., Zhan, Y., Ahn, T., & Lin, Z. (2021). TSSr: an R package for comprehensive analyses of TSS sequencing data. *NAR Genomics and Bioinformatics*, 3(4).
 
 ## License
 
