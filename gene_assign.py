@@ -1,465 +1,304 @@
 #!/usr/bin/env python3
 """
-Gene Assign - Assign TSS clusters to genes based on genomic annotations
+Assign TSS clusters to genes — strict parity with TSSr 0.99.6 annotateCluster().
 
-Supports GTF and GFF annotation formats.
+Mirrors:
+  TSSr::annotateCluster()       (AnnotationMethods.R)
+  TSSr::.assign2gene()          (AnnotationFunctions.R)
+
+Algorithm:
+  1. Build promoter regions per gene with neighbor-aware up/down distances.
+  2. Overlap each cluster's dominant_tss with promoter regions → assign `gene`
+     (deduplicated by first hit per cluster).
+  3. Overlap each cluster's dominant_tss with raw gene bodies → assign `inCoding`.
+  4. If filterCluster: within each (gene-or-inCoding) group, drop clusters that
+     are downstream of the dominant cluster AND below `filterClusterThreshold *
+     max(tags)`.
+
+Outputs:
+  - assigned    : clusters with non-NA gene
+  - unassigned  : clusters with NA gene
+  - filtered    : assigned+inCoding rows after the filter, plus clusters with
+                  no gene+no inCoding (unfiltered)
 """
 
+from __future__ import annotations
 import typer
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Dict, Tuple
 from pathlib import Path
+from typing import List, Optional, Dict, Tuple
+from urllib.parse import unquote
 import logging
-import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-__version__ = "0.1.0"
-
+__version__ = "0.18.0"
 app = typer.Typer(help=f"Assign TSS clusters to genes (v{__version__})")
 
 
-def parse_gtf_attributes(attr_string: str) -> Dict[str, str]:
-    """Parse GTF attribute string into dictionary."""
-    attrs = {}
-    # GTF format: key "value"; key "value";
-    pattern = r'(\w+)\s+"([^"]+)"'
-    for match in re.finditer(pattern, attr_string):
-        attrs[match.group(1)] = match.group(2)
-    return attrs
+# -----------------------------------------------------------------------------
+# GFF loading (mirrors GenomicFeatures::genes() output)
+# -----------------------------------------------------------------------------
+
+# Gene-like GFF feature types accepted as "gene" (matches what TSSr's
+# makeTxDbFromGFF + genes(txdb) treats as gene features in SGD-style GFFs).
+GENE_FEATURE_TYPES = {
+    'gene', 'tRNA_gene', 'transposable_element_gene', 'snoRNA_gene',
+    'rRNA_gene', 'ncRNA_gene', 'pseudogene', 'snRNA_gene',
+    'telomerase_RNA_gene',
+}
 
 
-def parse_gff_attributes(attr_string: str) -> Dict[str, str]:
-    """Parse GFF3 attribute string into dictionary."""
-    attrs = {}
-    # GFF3 format: key=value;key=value
-    for item in attr_string.split(';'):
-        item = item.strip()
-        if '=' in item:
-            key, value = item.split('=', 1)
-            # Handle URL encoding
-            value = value.replace('%2C', ',').replace('%3B', ';')
-            attrs[key] = value
-    return attrs
-
-
-def load_annotation(annotation_file: str, annotation_type: str = 'genes') -> pd.DataFrame:
+def load_genes_from_gff(gff_path: str) -> pd.DataFrame:
     """
-    Load gene annotation from GTF or GFF file.
+    Read a GFF3 file and return one row per gene-like feature with columns:
+    seqnames, start, end, strand, width, gene_id.
+    Matches the structure of TSSr's `as.data.frame(genes(txdb))`.
 
-    Args:
-        annotation_file: Path to GTF/GFF file
-        annotation_type: 'genes' for CDS-based, 'transcript' for transcript-based
-
-    Returns:
-        DataFrame with gene annotation (chr, start, end, strand, gene_id, gene_name)
+    Accepts the full set of SGD-style gene-like feature types
+    (gene, tRNA_gene, snoRNA_gene, etc.) and URL-decodes the ID attribute
+    (e.g. `tP%28UGG%29A` -> `tP(UGG)A`).
     """
-    logger.info(f"Loading annotation from: {annotation_file}")
-
-    # Detect file format
-    is_gtf = annotation_file.lower().endswith('.gtf')
-
-    records = []
-
-    with open(annotation_file, 'r') as f:
-        for line in f:
-            if line.startswith('#'):
+    rows = []
+    with open(gff_path) as fh:
+        for line in fh:
+            if not line or line.startswith('#'):
                 continue
-
-            fields = line.strip().split('\t')
-            if len(fields) < 9:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 9:
                 continue
-
-            chr_name = fields[0]
-            feature_type = fields[2]
-            start = int(fields[3])  # 1-based
-            end = int(fields[4])
-            strand = fields[6]
-            attrs_str = fields[8]
-
-            # Filter by feature type
-            if annotation_type == 'genes':
-                # Use CDS or gene features
-                if feature_type not in ['CDS', 'gene', 'mRNA']:
-                    continue
-            else:  # transcript
-                if feature_type not in ['transcript', 'mRNA', 'gene']:
-                    continue
-
-            # Parse attributes
-            if is_gtf:
-                attrs = parse_gtf_attributes(attrs_str)
-                gene_id = attrs.get('gene_id', attrs.get('gene_name', ''))
-                gene_name = attrs.get('gene_name', gene_id)
-            else:
-                attrs = parse_gff_attributes(attrs_str)
-                gene_id = attrs.get('ID', attrs.get('Name', attrs.get('gene', '')))
-                gene_name = attrs.get('Name', attrs.get('gene', gene_id))
-                # Handle Parent attribute for mRNA/CDS features
-                if 'Parent' in attrs and not gene_id:
-                    gene_id = attrs['Parent']
-
-            if gene_id:
-                records.append({
-                    'chr': chr_name,
-                    'start': start,
-                    'end': end,
-                    'strand': strand,
-                    'gene_id': gene_id,
-                    'gene_name': gene_name,
-                    'feature_type': feature_type
-                })
-
-    df = pd.DataFrame(records)
-
-    # Aggregate by gene (get min start and max end for each gene)
-    if len(df) > 0:
-        gene_df = df.groupby(['chr', 'strand', 'gene_id', 'gene_name']).agg({
-            'start': 'min',
-            'end': 'max'
-        }).reset_index()
-
-        # For plus strand genes, the 5' end is the start
-        # For minus strand genes, the 5' end is the end
-        gene_df['five_prime'] = np.where(
-            gene_df['strand'] == '+',
-            gene_df['start'],
-            gene_df['end']
-        )
-
-        logger.info(f"Loaded {len(gene_df)} genes")
-        return gene_df
-
-    return pd.DataFrame()
+            if parts[2] not in GENE_FEATURE_TYPES:
+                continue
+            chrom, start, end, strand, attrs = parts[0], int(parts[3]), int(parts[4]), parts[6], parts[8]
+            gene_id = ''
+            for kv in attrs.split(';'):
+                kv = kv.strip()
+                if kv.startswith('ID='):
+                    gene_id = unquote(kv[3:])
+                    break
+            if not gene_id:
+                continue
+            rows.append((chrom, start, end, strand, end - start + 1, gene_id))
+    df = pd.DataFrame(rows, columns=['seqnames', 'start', 'end', 'strand', 'width', 'gene_id'])
+    return df
 
 
-def assign_cluster_to_gene(cluster: pd.Series,
-                            gene_df: pd.DataFrame,
-                            upstream: int = 1000,
-                            downstream: int = 0,
-                            upstream_overlap: int = 500) -> Tuple[str, bool]:
+# -----------------------------------------------------------------------------
+# Promoter region construction (TSSr .assign2gene up/down logic)
+# -----------------------------------------------------------------------------
+
+def _promoter_regions(ref_sub: pd.DataFrame, strand: str,
+                      upstream: int, upstream_overlap: int, downstream: int) -> pd.DataFrame:
     """
-    Assign a single cluster to its downstream gene.
-
-    Assignment rules (from TSSr):
-    1. The dominant TSS must be upstream of the gene's 5' end (within upstream distance)
-    2. If the TSS overlaps with an upstream gene's coding region, it must be within
-       upstream_overlap distance of that gene's 3' end
-
-    Args:
-        cluster: Series with cluster information (must have chr, strand, dominant_tss)
-        gene_df: Gene annotation DataFrame
-        upstream: Maximum distance upstream of gene 5' end
-        downstream: Maximum distance downstream of gene 5' end (into gene body)
-        upstream_overlap: Max overlap with upstream gene's coding region
-
-    Returns:
-        Tuple of (gene_id, is_in_coding_region)
+    Per (chr, strand): construct promoter regions with neighbor-aware up/down
+    distances. Input must be a single-(chr,strand) slice with columns
+    seqnames, start, end, strand, width, gene_id.
+    Returns a copy with start/end overwritten to be the promoter range.
     """
-    chr_name = cluster['chr']
-    strand = cluster['strand']
-    dom_tss = cluster['dominant_tss']
+    df = ref_sub.copy()
+    if strand == '+':
+        # R's data.table::setorder is stable; pandas default quicksort isn't.
+        # Stable sort is required to match TSSr when multiple genes share a start.
+        df = df.sort_values('start', kind='stable').reset_index(drop=True)
+        end_b = df['end'].shift(1, fill_value=0).to_numpy()       # prev gene's end
+        width = df['width'].shift(1, fill_value=1000).to_numpy()  # prev gene's width
+        dis = df['start'].to_numpy() - end_b
+        up = np.where(dis > upstream, upstream,
+              np.where(dis + width <= upstream_overlap, dis + width - 1,
+               np.where(dis < upstream_overlap, upstream_overlap, dis)))
+        start_a = df['start'].shift(-1, fill_value=1000).to_numpy()  # next gene's start
+        dis_start = start_a - df['start'].to_numpy()
+        down_up = np.roll(up, -1)  # next gene's up
+        down_up[-1] = 1000
+        down = np.where(dis_start > downstream + down_up, downstream,
+                np.where(dis_start < down_up, 0,
+                         dis_start - down_up))
+        new_end = df['start'].to_numpy() + down
+        new_start = new_end - down - up + 1
+    else:  # minus strand
+        df = df.sort_values('end', kind='stable').reset_index(drop=True)
+        # end.b = lead(start, 1, fill=0); last row overrides to end + 1000
+        end_b = df['start'].shift(-1, fill_value=0).to_numpy()
+        end_b[-1] = df['end'].iloc[-1] + 1000
+        width = df['width'].shift(-1, fill_value=1000).to_numpy()
+        dis = end_b - df['end'].to_numpy()
+        up = np.where(dis > upstream, upstream,
+              np.where(dis + width <= upstream_overlap, dis + width - 1,
+               np.where(dis < upstream_overlap, upstream_overlap, dis)))
+        start_a = df['end'].shift(1, fill_value=1000).to_numpy()  # prev gene's end (in this sort order)
+        dis_start = df['end'].to_numpy() - start_a
+        down_up = np.roll(up, 1)  # prev gene's up
+        down_up[0] = 1000
+        down = np.where(dis_start >= downstream + down_up, downstream,
+                np.where(dis_start < down_up, 0,
+                         dis_start - down_up))
+        new_start = df['end'].to_numpy() - down
+        new_end = new_start + down + up - 1
+    df['start'] = new_start.astype(np.int64)
+    df['end'] = new_end.astype(np.int64)
+    return df
 
-    # Filter genes on same chromosome and strand
-    genes = gene_df[(gene_df['chr'] == chr_name) & (gene_df['strand'] == strand)]
 
-    if genes.empty:
-        return '', False
+# -----------------------------------------------------------------------------
+# Overlap helpers (single-point queries against ranges)
+# -----------------------------------------------------------------------------
 
-    best_gene = ''
-    in_coding = False
-    best_distance = float('inf')
-
-    for _, gene in genes.iterrows():
-        gene_id = gene['gene_id']
-        gene_start = gene['start']
-        gene_end = gene['end']
-        five_prime = gene['five_prime']
-
-        if strand == '+':
-            # Plus strand: TSS should be upstream (smaller position) of gene start
-            distance = five_prime - dom_tss
-
-            # Check if TSS is in valid range
-            if -downstream <= distance <= upstream:
-                # Check if TSS overlaps with coding region
-                is_inside = gene_start <= dom_tss <= gene_end
-
-                if is_inside:
-                    # TSS is inside the gene - this might be internal TSS
-                    in_coding = True
-
-                if distance >= 0 and distance < best_distance:
-                    best_gene = gene_id
-                    best_distance = distance
-                elif distance < 0 and abs(distance) <= downstream and not best_gene:
-                    # TSS is slightly downstream (inside gene)
-                    best_gene = gene_id
-                    in_coding = True
-
+def _first_overlapping_gene(positions: np.ndarray, ranges: pd.DataFrame) -> List[Optional[str]]:
+    """
+    For each position (single-base), find the first range (by row order) that
+    contains it inclusively. Returns the gene_id of that range, or None.
+    Mirrors TSSr's `findOverlaps` then dedup-by-queryHits behaviour.
+    """
+    starts = ranges['start'].to_numpy()
+    ends = ranges['end'].to_numpy()
+    gene_ids = ranges['gene_id'].to_numpy()
+    out: List[Optional[str]] = []
+    for p in positions:
+        # Naive O(N) for clarity; cluster counts are in thousands so fine
+        hits = np.where((starts <= p) & (ends >= p))[0]
+        if len(hits) == 0:
+            out.append(None)
         else:
-            # Minus strand: TSS should be upstream (larger position) of gene end
-            distance = dom_tss - five_prime
-
-            if -downstream <= distance <= upstream:
-                is_inside = gene_start <= dom_tss <= gene_end
-
-                if is_inside:
-                    in_coding = True
-
-                if distance >= 0 and distance < best_distance:
-                    best_gene = gene_id
-                    best_distance = distance
-                elif distance < 0 and abs(distance) <= downstream and not best_gene:
-                    best_gene = gene_id
-                    in_coding = True
-
-    return best_gene, in_coding
+            out.append(str(gene_ids[hits[0]]))
+    return out
 
 
-def assign_clusters_to_genes(cluster_df: pd.DataFrame,
-                              gene_df: pd.DataFrame,
-                              upstream: int = 1000,
-                              downstream: int = 0,
-                              upstream_overlap: int = 500,
-                              filter_threshold: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
+# -----------------------------------------------------------------------------
+# Driver: assign one sample's clusters to genes
+# -----------------------------------------------------------------------------
+
+def assign_one_sample(cluster_df: pd.DataFrame,
+                      ref_genes: pd.DataFrame,
+                      upstream: int = 1000,
+                      upstream_overlap: int = 500,
+                      downstream: int = 0,
+                      filter_cluster: bool = True) -> pd.DataFrame:
     """
-    Assign all clusters to genes.
-
-    Args:
-        cluster_df: Cluster DataFrame
-        gene_df: Gene annotation DataFrame
-        upstream: Max upstream distance
-        downstream: Max downstream distance
-        upstream_overlap: Max overlap with upstream gene
-        filter_threshold: Minimum cluster TPM to include
-
-    Returns:
-        Tuple of (assigned_clusters, unassigned_clusters)
+    For one sample's clusters, assign gene + (optional) inCoding, sort by cluster.
+    Output mirrors TSSr's per-sample asn DataFrame (before split into assigned/
+    unassigned/filtered).
     """
-    # Filter clusters if threshold specified
-    if filter_threshold > 0 and 'tags_TPM' in cluster_df.columns:
-        cluster_df = cluster_df[cluster_df['tags_TPM'] >= filter_threshold].copy()
-    elif filter_threshold > 0 and 'tags' in cluster_df.columns:
-        cluster_df = cluster_df[cluster_df['tags'] >= filter_threshold].copy()
+    # Stratify both inputs by (chr, strand) — only matching strata interact.
+    cs_chr_strand = list(cluster_df.groupby(['chr', 'strand'], sort=False).groups.keys())
+    ref_chr_strand = set(map(tuple, ref_genes[['seqnames', 'strand']].drop_duplicates().to_numpy()))
 
-    assignments = []
-    for idx, cluster in cluster_df.iterrows():
-        gene_id, in_coding = assign_cluster_to_gene(
-            cluster, gene_df, upstream, downstream, upstream_overlap
-        )
-        assignments.append({
-            'gene': gene_id,
-            'in_coding': in_coding
-        })
+    rows = []
+    for (chrom, strand), idx in cluster_df.groupby(['chr', 'strand'], sort=False).groups.items():
+        cs_grp = cluster_df.loc[idx].copy()
+        if (chrom, strand) not in ref_chr_strand:
+            cs_grp['gene'] = None
+            if filter_cluster:
+                cs_grp['inCoding'] = None
+            rows.append(cs_grp)
+            continue
 
-    assign_df = pd.DataFrame(assignments)
-    result = pd.concat([cluster_df.reset_index(drop=True), assign_df], axis=1)
+        ref_sub = ref_genes[(ref_genes['seqnames'] == chrom) & (ref_genes['strand'] == strand)].copy()
 
-    # Split into assigned and unassigned
-    assigned = result[result['gene'] != ''].copy()
-    unassigned = result[result['gene'] == ''].copy()
+        # Promoter overlap
+        prom = _promoter_regions(ref_sub, strand, upstream, upstream_overlap, downstream)
+        cs_grp['gene'] = _first_overlapping_gene(cs_grp['dominant_tss'].to_numpy(),
+                                                  prom[['start', 'end', 'gene_id']])
+        # Coding-body overlap (raw gene start/end, no promoter expansion)
+        if filter_cluster:
+            ref_coding = ref_sub.sort_values('start', kind='stable').reset_index(drop=True)
+            cs_grp['inCoding'] = _first_overlapping_gene(cs_grp['dominant_tss'].to_numpy(),
+                                                          ref_coding[['start', 'end', 'gene_id']])
+        rows.append(cs_grp)
 
-    logger.info(f"Assigned: {len(assigned)} clusters, Unassigned: {len(unassigned)} clusters")
+    if not rows:
+        return cluster_df.copy()
+    out = pd.concat(rows, ignore_index=False)
+    out = out.sort_values('cluster').reset_index(drop=True)
+    return out
 
-    return assigned, unassigned
 
+def filter_assigned(asn: pd.DataFrame, filter_cluster_threshold: float) -> pd.DataFrame:
+    """
+    TSSr's filter step: within each (gene-or-inCoding) group, drop clusters
+    that are downstream of the dominant cluster AND below threshold.
+    Clusters with both gene and inCoding NA pass through unfiltered.
+    """
+    m = asn[asn['gene'].isna() & asn['inCoding'].isna()].copy()
+    n = asn[asn['gene'].notna() | asn['inCoding'].notna()].copy()
+    if n.empty:
+        return m
+
+    # If both gene and inCoding set, drop inCoding (gene assignment wins)
+    n['inCoding'] = np.where(n['gene'].notna() & n['inCoding'].notna(), None, n['inCoding'])
+    n['r'] = n['gene'].where(n['gene'].notna(), n['inCoding'])
+
+    kept = []
+    for r_val, grp in n.groupby('r', sort=False):
+        max_idx = grp['tags'].idxmax()
+        max_tags = float(grp.at[max_idx, 'tags'])
+        dom_of_max = int(grp.at[max_idx, 'dominant_tss'])
+        thr = max_tags * filter_cluster_threshold
+        if grp['strand'].iloc[0] == '+':
+            f = ~((grp['dominant_tss'] > dom_of_max) & (grp['tags'] < thr))
+        else:
+            f = ~((grp['dominant_tss'] < dom_of_max) & (grp['tags'] < thr))
+        kept.append(grp[f])
+    n_filtered = pd.concat(kept, ignore_index=True) if kept else pd.DataFrame(columns=n.columns)
+    n_filtered = n_filtered.drop(columns=['r'], errors='ignore')
+
+    # TSSr's `rbind(m[,seq(12)], new[,seq(12)])` takes the first 12 columns of each.
+    keep_cols = [c for c in m.columns if c != 'r']
+    out = pd.concat([m[keep_cols], n_filtered[keep_cols]], ignore_index=True)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 
 @app.command("assign")
 def assign_command(
-    cluster_file: Path = typer.Option(
-        ..., "-c", "--clusters",
-        help="Input cluster file"
-    ),
-    annotation_file: Path = typer.Option(
-        ..., "-a", "--annotation",
-        help="Gene annotation file (GTF or GFF format)"
-    ),
-    output_assigned: Path = typer.Option(
-        ..., "-o", "--output",
-        help="Output file for assigned clusters"
-    ),
-    output_unassigned: Optional[Path] = typer.Option(
-        None, "-u", "--unassigned",
-        help="Output file for unassigned clusters (optional)"
-    ),
-    annotation_type: str = typer.Option(
-        "genes", "--annotation-type",
-        help="Annotation type: 'genes' (CDS-based) or 'transcript'"
-    ),
-    upstream: int = typer.Option(
-        1000, "--upstream",
-        help="Maximum distance upstream of gene 5' end"
-    ),
-    downstream: int = typer.Option(
-        0, "--downstream",
-        help="Maximum distance downstream (into gene body)"
-    ),
-    filter_threshold: float = typer.Option(
-        0.02, "--filter-threshold",
-        help="Minimum cluster TPM threshold"
-    ),
+    cluster_inputs: List[Path] = typer.Option(..., "-c", "--clusters",
+                                              help="Per-sample cluster files (from clustering or consensusCluster)"),
+    sample_names: str = typer.Option(..., "-n", "--sample-names",
+                                     help='Sample names, space-separated'),
+    gff_file: Path = typer.Option(..., "-a", "--annotation",
+                                  help="GFF3 annotation file"),
+    output_prefix: Path = typer.Option(..., "-o", "--output-prefix",
+                                       help="Output prefix; produces <prefix>.<sample>.{assigned,unassigned,filtered}.tsv"),
+    upstream: int = typer.Option(1000, "--upstream"),
+    upstream_overlap: int = typer.Option(500, "--upstream-overlap"),
+    downstream: int = typer.Option(0, "--downstream"),
+    filter_cluster: bool = typer.Option(True, "--filter-cluster/--no-filter-cluster"),
+    filter_cluster_threshold: float = typer.Option(0.02, "--filter-cluster-threshold"),
+    ref_table: Optional[Path] = typer.Option(None, "--ref-table",
+                                             help="Optional precomputed gene-reference TSV (parity testing)"),
 ):
-    """
-    Assign TSS clusters to downstream genes.
+    """TSSr-style annotateCluster: assign clusters to genes via GFF."""
+    names = sample_names.split()
+    if len(names) != len(cluster_inputs):
+        raise typer.BadParameter(
+            f"sample-names count ({len(names)}) != cluster files count ({len(cluster_inputs)})")
 
-    A cluster is assigned to a gene if its dominant TSS is within the
-    specified upstream distance of the gene's transcription start site.
+    if ref_table is not None:
+        ref_genes = pd.read_csv(ref_table, sep='\t')
+    else:
+        ref_genes = load_genes_from_gff(str(gff_file))
+    logger.info(f"loaded {len(ref_genes)} gene features")
 
-    Example:
-        tsspy geneAssign assign -c clusters.tsv -a annotation.gtf -o assigned.tsv
-    """
-    logger.info(f"Loading clusters: {cluster_file}")
-    cluster_df = pd.read_csv(cluster_file, sep='\t')
-
-    # Load annotation
-    gene_df = load_annotation(str(annotation_file), annotation_type)
-
-    if gene_df.empty:
-        logger.error("No genes found in annotation file")
-        raise typer.Exit(1)
-
-    logger.info(f"Assigning clusters (upstream={upstream}, downstream={downstream})")
-
-    assigned, unassigned = assign_clusters_to_genes(
-        cluster_df, gene_df,
-        upstream=upstream,
-        downstream=downstream,
-        filter_threshold=filter_threshold
-    )
-
-    # Save assigned clusters
-    assigned.to_csv(output_assigned, sep='\t', index=False)
-    logger.info(f"Saved assigned clusters to {output_assigned}")
-
-    # Save unassigned clusters if requested
-    if output_unassigned:
-        unassigned.to_csv(output_unassigned, sep='\t', index=False)
-        logger.info(f"Saved unassigned clusters to {output_unassigned}")
-
-    # Report statistics
-    if 'gene' in assigned.columns:
-        unique_genes = assigned['gene'].nunique()
-        logger.info(f"Total assigned clusters: {len(assigned)}")
-        logger.info(f"Unique genes with assigned clusters: {unique_genes}")
-
-        if 'in_coding' in assigned.columns:
-            in_coding_count = assigned['in_coding'].sum()
-            logger.info(f"Clusters inside coding regions: {in_coding_count}")
-
-
-@app.command("summary")
-def summary_command(
-    assigned_file: Path = typer.Option(
-        ..., "-i", "--input",
-        help="Input assigned clusters file"
-    ),
-    output_file: Path = typer.Option(
-        ..., "-o", "--output",
-        help="Output gene-level summary file"
-    ),
-):
-    """
-    Create a gene-level summary from assigned clusters.
-
-    Aggregates cluster information by gene, reporting:
-    - Number of clusters per gene
-    - Total and max tags
-    - Primary cluster (highest tags)
-
-    Example:
-        tsspy geneAssign summary -i assigned.tsv -o gene_summary.tsv
-    """
-    logger.info(f"Loading assigned clusters: {assigned_file}")
-    df = pd.read_csv(assigned_file, sep='\t')
-
-    if 'gene' not in df.columns:
-        raise typer.BadParameter("Input file must have 'gene' column")
-
-    # Determine tag column
-    tag_col = 'tags_TPM' if 'tags_TPM' in df.columns else 'tags'
-
-    # Group by gene
-    summary = df.groupby('gene').agg({
-        'chr': 'first',
-        'strand': 'first',
-        'dominant_tss': lambda x: list(x),
-        tag_col: ['sum', 'max', 'count']
-    }).reset_index()
-
-    # Flatten column names
-    summary.columns = ['gene', 'chr', 'strand', 'dominant_tss_positions',
-                       'total_tags', 'max_cluster_tags', 'n_clusters']
-
-    # Convert list to string for output
-    summary['dominant_tss_positions'] = summary['dominant_tss_positions'].apply(
-        lambda x: ','.join(map(str, x))
-    )
-
-    # Sort by total tags
-    summary = summary.sort_values('total_tags', ascending=False)
-
-    # Save
-    summary.to_csv(output_file, sep='\t', index=False)
-    logger.info(f"Saved gene summary to {output_file}")
-    logger.info(f"Total genes: {len(summary)}")
-
-
-@app.command("filter")
-def filter_command(
-    assigned_file: Path = typer.Option(
-        ..., "-i", "--input",
-        help="Input assigned clusters file"
-    ),
-    output_file: Path = typer.Option(
-        ..., "-o", "--output",
-        help="Output filtered file"
-    ),
-    keep_primary: bool = typer.Option(
-        False, "--keep-primary",
-        help="Keep only the primary (highest tags) cluster per gene"
-    ),
-    exclude_internal: bool = typer.Option(
-        False, "--exclude-internal",
-        help="Exclude clusters inside coding regions"
-    ),
-    min_tags: float = typer.Option(
-        0.0, "--min-tags",
-        help="Minimum tags threshold"
-    ),
-):
-    """
-    Filter assigned clusters based on various criteria.
-
-    Example:
-        tsspy geneAssign filter -i assigned.tsv -o filtered.tsv --keep-primary
-    """
-    logger.info(f"Loading assigned clusters: {assigned_file}")
-    df = pd.read_csv(assigned_file, sep='\t')
-
-    original_count = len(df)
-
-    # Filter by internal status
-    if exclude_internal and 'in_coding' in df.columns:
-        df = df[~df['in_coding']]
-        logger.info(f"Excluded internal clusters: {original_count} -> {len(df)}")
-
-    # Filter by min tags
-    tag_col = 'tags_TPM' if 'tags_TPM' in df.columns else 'tags'
-    if min_tags > 0:
-        df = df[df[tag_col] >= min_tags]
-        logger.info(f"Filtered by min tags ({min_tags}): {len(df)} remaining")
-
-    # Keep only primary cluster per gene
-    if keep_primary and 'gene' in df.columns:
-        df = df.loc[df.groupby('gene')[tag_col].idxmax()]
-        logger.info(f"Kept primary clusters only: {len(df)} remaining")
-
-    # Save
-    df.to_csv(output_file, sep='\t', index=False)
-    logger.info(f"Saved filtered clusters to {output_file}")
+    for n, p in zip(names, cluster_inputs):
+        cluster_df = pd.read_csv(p, sep='\t')
+        asn = assign_one_sample(cluster_df, ref_genes,
+                                upstream=upstream,
+                                upstream_overlap=upstream_overlap,
+                                downstream=downstream,
+                                filter_cluster=filter_cluster)
+        assigned = asn[asn['gene'].notna()].drop(columns=['inCoding'], errors='ignore').copy()
+        unassigned = asn[asn['gene'].isna()].drop(columns=['inCoding'], errors='ignore').copy()
+        assigned.to_csv(f"{output_prefix}.{n}.assigned.tsv", sep='\t', index=False)
+        unassigned.to_csv(f"{output_prefix}.{n}.unassigned.tsv", sep='\t', index=False)
+        logger.info(f"{n}: assigned={len(assigned)}  unassigned={len(unassigned)}")
+        if filter_cluster:
+            filtered = filter_assigned(asn, filter_cluster_threshold)
+            filtered.to_csv(f"{output_prefix}.{n}.filtered.tsv", sep='\t', index=False)
+            logger.info(f"{n}: filtered={len(filtered)}")
 
 
 if __name__ == '__main__':
