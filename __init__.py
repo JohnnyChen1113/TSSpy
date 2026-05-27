@@ -6,7 +6,7 @@ A comprehensive command-line tool for transcription start site (TSS) data analys
 Inspired by TSSr (R/Bioconductor) but implemented in pure Python.
 """
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 __author__ = "Johnny Chen"
 
 from TSSpy.main import app, main
