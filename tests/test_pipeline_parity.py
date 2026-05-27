@@ -332,6 +332,22 @@ def test_plot_shape_smoke(workdir, data_dir):
     assert out.exists() and out.stat().st_size > 1_000
 
 
+def test_plot_tss_smoke(workdir, data_dir):
+    """Browser-style multi-page TSS plot for selected genes."""
+    out = workdir / "tss_browser.pdf"
+    run_tsspy(
+        "plot", "tss",
+        "-t", str(data_dir / "tssr_stage3b_poisson_normalized.TSS.tsv"),
+        "-c", str(data_dir / "tssr_stage5_consensus_YPD.tsv"),
+        "-c", str(data_dir / "tssr_stage5_consensus_Arrest.tsv"),
+        "-n", "YPD Arrest",
+        "-a", str(data_dir / "saccharomyces_cerevisiae_R64-2-1.gff"),
+        "--genes", "YAL003W YAL062W YBR090C",
+        "-o", str(out),
+    )
+    assert out.exists() and out.stat().st_size > 5_000
+
+
 # ---------- Auxiliary: correlation ----------
 
 def test_correlation_smoke(workdir, data_dir):

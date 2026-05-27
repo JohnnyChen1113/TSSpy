@@ -41,7 +41,7 @@ from TSSpy import shape_cluster
 from TSSpy import plot
 from TSSpy.correlation import correlation
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 # Create main app
 app = typer.Typer(
