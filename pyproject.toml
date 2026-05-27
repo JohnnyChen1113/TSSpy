@@ -35,8 +35,9 @@ dependencies = [
     "pyBigWig>=0.3.18",
     "matplotlib>=3.5",
     "scipy>=1.9",
-    "scikit-learn>=1.1",      # plotnine + plotTssPCA's PCA
-    "plotnine>=0.12",         # ggplot2-style plotting for plot* commands
+    "scikit-learn>=1.1",      # plotTssPCA's PCA
+    "plotnine>=0.12",         # ggplot2-style for plot pca/iqw/shape
+    "coolbox>=0.4",           # IGV-style multi-track for plot tss
 ]
 
 [project.optional-dependencies]

@@ -23,7 +23,7 @@ import logging
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import FancyArrow, Rectangle
+
 from plotnine import (
     ggplot, aes, geom_point, geom_histogram, facet_wrap,
     theme_minimal, theme, element_text, labs, scale_fill_brewer, scale_color_brewer,
@@ -33,7 +33,7 @@ from plotnine import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-__version__ = "0.22.0"
+__version__ = "0.24.0"
 app = typer.Typer(help=f"Diagnostic plots (plotnine / ggplot2-style) (v{__version__})")
 
 KEY_COLS = ['chr', 'pos', 'strand']
@@ -220,10 +220,10 @@ def shape_command(
 
 
 # -----------------------------------------------------------------------------
-# plot tss  (TSSr::plotTSS)
+# plot tss  (TSSr::plotTSS) — coolbox-based
 # -----------------------------------------------------------------------------
 
-# Per-sample bar/cluster track palette — cycled like R's rainbow()
+# Per-sample colour cycle (matches TSSr's rainbow() vibe)
 _TRACK_PALETTE = ["#FF0000", "#0000FF", "#008000", "#FFA500",
                   "#800080", "#00CED1", "#A52A2A", "#FF1493"]
 
@@ -243,10 +243,89 @@ def _load_gene_ref(ref_table: Optional[Path], gff: Optional[Path]) -> pd.DataFra
     raise typer.BadParameter("Need --ref-table or --annotation (GFF).")
 
 
-def _plot_one_gene_tss(gene_row, tss_window: pd.DataFrame,
-                       per_sample_clusters: dict, sample_cols: List[str],
-                       up_dis: int, down_dis: int, bidirection: bool, y_fixed: bool):
-    """Render one gene's TSS browser-style figure to a matplotlib Figure."""
+def _write_sample_bigwig(tss_df: pd.DataFrame, sample: str, chrom_sizes: dict,
+                         path: str, strand: str, negate: bool):
+    """Write one BigWig per sample × strand. If `negate`, values become negative
+    (used for minus strand so coolbox draws downward bars relative to baseline)."""
+    import pyBigWig
+    sub = tss_df[tss_df["strand"] == strand][["chr", "pos", sample]].copy()
+    sub = sub[sub[sample] > 0]
+    sub[sample] = sub[sample].astype(float)
+    if negate:
+        sub[sample] = -sub[sample]
+    sub = sub[sub["chr"].isin(chrom_sizes)]
+    present = [c for c in chrom_sizes if c in set(sub["chr"].unique())]
+    chr_order = {c: i for i, c in enumerate(present)}
+    sub["_o"] = sub["chr"].map(chr_order)
+    sub = sub.sort_values(["_o", "pos"], kind="stable").reset_index(drop=True)
+
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader([(c, chrom_sizes[c]) for c in present])
+    if not sub.empty:
+        for chrom, grp in sub.groupby("chr", sort=False):
+            chroms = [chrom] * len(grp)
+            starts = (grp["pos"].astype(int) - 1).tolist()
+            ends = grp["pos"].astype(int).tolist()
+            values = grp[sample].astype(float).tolist()
+            bw.addEntries(chroms, starts, ends=ends, values=values)
+    bw.close()
+
+
+def _write_clusters_bed(cluster_df: pd.DataFrame, path: str):
+    """Per-sample clusters → BED6 using q_0.1..q_0.9 as the span."""
+    keep = cluster_df[["chr", "q_0.1", "q_0.9", "cluster", "strand"]].copy()
+    keep["start_0based"] = (keep["q_0.1"].astype(int) - 1).clip(lower=0)
+    keep["end"] = keep["q_0.9"].astype(int)
+    keep["name"] = keep["cluster"].astype(int).astype(str)
+    keep["score"] = 0
+    keep[["chr", "start_0based", "end", "name", "score", "strand"]].to_csv(
+        path, sep="\t", index=False, header=False)
+
+
+def _write_gene_bed(ref_df: pd.DataFrame, path: str):
+    """All gene rows → BED6 for the gene-model track."""
+    out = ref_df[["chr", "start", "end", "gene_id", "strand"]].copy()
+    out["start_0based"] = (out["start"].astype(int) - 1).clip(lower=0)
+    out["end"] = out["end"].astype(int)
+    out["score"] = 0
+    out["name"] = out["gene_id"]
+    out[["chr", "start_0based", "end", "name", "score", "strand"]].to_csv(
+        path, sep="\t", index=False, header=False)
+
+
+def _build_coolbox_frame(gene_bed_path: str,
+                         sample_bw_plus_paths: List[str],
+                         sample_bw_minus_paths: List[str],
+                         sample_cluster_bed_paths: List[str],
+                         sample_names: List[str]):
+    """Compose coolbox Frame: XAxis + gene + (clusters + + strand bw + - strand bw) per sample."""
+    from coolbox.api import XAxis, BED, BigWig
+
+    frame = XAxis()
+    frame = frame + BED(gene_bed_path, gene_style="flybase", title="gene",
+                        height=1.0, color="#4682B4", labels=True, fontsize=8)
+    for i, (sample, bw_plus, bw_minus, clu) in enumerate(zip(
+            sample_names, sample_bw_plus_paths, sample_bw_minus_paths,
+            sample_cluster_bed_paths)):
+        color = _TRACK_PALETTE[i % len(_TRACK_PALETTE)]
+        frame = (frame
+                 + BED(clu, title=f"{sample} clusters", color=color,
+                       height=0.6, labels=True, fontsize=7, gene_style="normal")
+                 + BigWig(bw_plus, title=f"{sample} TSS (+)", color=color,
+                          height=1.0, style="fill", line_width=0.6)
+                 + BigWig(bw_minus, title=f"{sample} TSS (-)", color=color,
+                          height=1.0, style="fill", line_width=0.6))
+    return frame
+
+
+def _plot_one_gene_coolbox(gene_row,
+                           sample_names: List[str],
+                           sample_bw_plus_paths: List[str],
+                           sample_bw_minus_paths: List[str],
+                           sample_cluster_bed_paths: List[str],
+                           gene_bed_path: str,
+                           up_dis: int, down_dis: int):
+    """Render one gene's TSS plot via coolbox; return matplotlib Figure."""
     gene_chr = gene_row["chr"]
     gene_start = int(gene_row["start"])
     gene_end = int(gene_row["end"])
@@ -254,115 +333,18 @@ def _plot_one_gene_tss(gene_row, tss_window: pd.DataFrame,
     gene_id = gene_row.get("gene_id", "?")
 
     if gene_strand == "+":
-        x_lo = gene_start - up_dis
+        x_lo = max(1, gene_start - up_dis)
         x_hi = gene_end + down_dis
     else:
-        x_lo = gene_start - down_dis
+        x_lo = max(1, gene_start - down_dis)
         x_hi = gene_end + up_dis
 
-    n_samples = len(sample_cols)
-    # Rows: 1 axis, 1 gene model, n_samples * 2 (cluster + TSS)
-    n_rows = 2 + 2 * n_samples
-    height_ratios = [0.6, 0.8] + [0.5, 1.5] * n_samples
-    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 1.5 + 0.6 * n_rows),
-                             sharex=True,
-                             gridspec_kw={"height_ratios": height_ratios})
-    fig.suptitle(f"{gene_id}  ({gene_chr}:{gene_start}-{gene_end} {gene_strand})", fontsize=12)
-
-    # Row 0: genomic axis
-    ax_axis = axes[0]
-    ax_axis.set_yticks([])
-    ax_axis.set_frame_on(False)
-    ax_axis.set_xlim(x_lo, x_hi)
-    ax_axis.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False)
-    ax_axis.text(x_lo, 0.5, f"{gene_chr}:{x_lo:,}-{x_hi:,}", fontsize=8,
-                 va="center", ha="left", transform=ax_axis.transData)
-
-    # Row 1: gene model (arrow)
-    ax_gene = axes[1]
-    ax_gene.set_yticks([])
-    ax_gene.set_frame_on(False)
-    ax_gene.set_xlim(x_lo, x_hi)
-    arrow_y = 0.5
-    arrow_height = 0.4
-    if gene_strand == "+":
-        ax_gene.add_patch(FancyArrow(
-            gene_start, arrow_y, gene_end - gene_start, 0,
-            width=arrow_height, length_includes_head=True,
-            head_width=arrow_height * 1.5,
-            head_length=min(150, (gene_end - gene_start) * 0.2),
-            facecolor="#4682B4", edgecolor="black", linewidth=0.5))
-    else:
-        ax_gene.add_patch(FancyArrow(
-            gene_end, arrow_y, gene_start - gene_end, 0,
-            width=arrow_height, length_includes_head=True,
-            head_width=arrow_height * 1.5,
-            head_length=min(150, (gene_end - gene_start) * 0.2),
-            facecolor="#4682B4", edgecolor="black", linewidth=0.5))
-    ax_gene.text(0.0, 0.5, "gene", transform=ax_gene.transAxes,
-                 ha="right", va="center", fontsize=8)
-    ax_gene.set_ylim(0, 1)
-
-    # Determine shared y range for TSS tracks if y_fixed
-    if y_fixed:
-        all_vals = tss_window[sample_cols].to_numpy()
-        if all_vals.size:
-            y_max = float(np.nanmax(np.abs(all_vals))) * 1.1
-        else:
-            y_max = 1.0
-    else:
-        y_max = None
-
-    for idx, sample in enumerate(sample_cols):
-        color = _TRACK_PALETTE[idx % len(_TRACK_PALETTE)]
-        # Row 2 + 2*idx: cluster boxes
-        ax_clu = axes[2 + 2 * idx]
-        ax_clu.set_yticks([])
-        ax_clu.set_xlim(x_lo, x_hi)
-        ax_clu.set_frame_on(False)
-        ax_clu.text(0.0, 0.5, f"{sample}\nclusters", transform=ax_clu.transAxes,
-                    ha="right", va="center", fontsize=8)
-        clu = per_sample_clusters.get(sample)
-        if clu is not None:
-            sub = clu[(clu["chr"] == gene_chr) &
-                      (clu["strand"] == gene_strand) &
-                      (clu["q_0.1"] >= x_lo) & (clu["q_0.9"] <= x_hi)]
-            for _, r in sub.iterrows():
-                ax_clu.add_patch(Rectangle((r["q_0.1"], 0.2), r["q_0.9"] - r["q_0.1"], 0.6,
-                                           facecolor=color, alpha=0.4, edgecolor=color))
-                if "cluster" in r and pd.notna(r["cluster"]):
-                    ax_clu.text((r["q_0.1"] + r["q_0.9"]) / 2, 0.5, str(int(r["cluster"])),
-                                ha="center", va="center", fontsize=7, color="black")
-        ax_clu.set_ylim(0, 1)
-
-        # Row 3 + 2*idx: TSS bars
-        ax_tss = axes[3 + 2 * idx]
-        ax_tss.set_xlim(x_lo, x_hi)
-        ax_tss.spines["top"].set_visible(False)
-        ax_tss.spines["right"].set_visible(False)
-        ax_tss.text(0.0, 0.5, f"{sample}\nTSS (TPM)", transform=ax_tss.transAxes,
-                    ha="right", va="center", fontsize=8)
-        ax_tss.axhline(0, color="grey", linewidth=0.5)
-        if bidirection:
-            sub = tss_window[(tss_window["chr"] == gene_chr) &
-                             (tss_window["pos"] >= x_lo) & (tss_window["pos"] <= x_hi)]
-        else:
-            sub = tss_window[(tss_window["chr"] == gene_chr) &
-                             (tss_window["strand"] == gene_strand) &
-                             (tss_window["pos"] >= x_lo) & (tss_window["pos"] <= x_hi)]
-        positions = sub["pos"].to_numpy()
-        values = sub[sample].astype(float).to_numpy()
-        # Minus-strand TSS values are negated (TSSr convention; we mirror that)
-        minus_mask = (sub["strand"].to_numpy() == "-")
-        plot_vals = values.copy()
-        plot_vals[minus_mask] = -np.abs(plot_vals[minus_mask])
-        plot_vals[~minus_mask] = np.abs(plot_vals[~minus_mask])
-        ax_tss.vlines(positions, 0, plot_vals, color=color, linewidth=0.8)
-        if y_max is not None and y_max > 0:
-            ax_tss.set_ylim(-y_max, y_max)
-
-    axes[-1].set_xlabel(f"{gene_chr} position")
-    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    frame = _build_coolbox_frame(gene_bed_path, sample_bw_plus_paths,
+                                  sample_bw_minus_paths,
+                                  sample_cluster_bed_paths, sample_names)
+    fig = frame.plot(f"{gene_chr}:{x_lo}-{x_hi}", close_fig=False)
+    fig.suptitle(f"{gene_id}  ({gene_chr}:{gene_start}-{gene_end} {gene_strand})",
+                 fontsize=12, y=1.02)
     return fig
 
 
@@ -378,6 +360,8 @@ def tss_command(
                                               help="GFF3 annotation (one row per gene)"),
     ref_table: Optional[Path] = typer.Option(None, "--ref-table",
                                              help="Alternative to --annotation: pre-parsed gene TSV"),
+    reference: Optional[Path] = typer.Option(None, "-r", "--reference",
+                                             help="Reference FASTA (chrom sizes for BigWig)"),
     genes: str = typer.Option(..., "--genes",
                               help='Gene IDs to plot, space-separated (e.g. "YAL001C YPK1")'),
     output: Path = typer.Option("TSS_graphs.pdf", "-o", "--output",
@@ -397,6 +381,9 @@ def tss_command(
     Multi-track stacked layout per page: genomic axis + gene model arrow
     + (cluster boxes + TSS bars) per sample.
     """
+    import tempfile
+    from TSSpy.bigwig import _read_chrom_sizes
+
     names = sample_names.split()
     if len(names) != len(cluster_inputs):
         raise typer.BadParameter(
@@ -415,15 +402,39 @@ def tss_command(
     missing_cols = [n for n in names if n not in tss_df.columns]
     if missing_cols:
         raise typer.BadParameter(f"sample cols missing in TSS table: {missing_cols}")
+    if reference is None:
+        raise typer.BadParameter("--reference FASTA is required (for BigWig chrom sizes)")
 
-    per_sample_clusters = {n: pd.read_csv(p, sep="\t") for n, p in zip(names, cluster_inputs)}
+    chrom_sizes = _read_chrom_sizes(str(reference), None)
 
-    with PdfPages(str(output)) as pdf:
-        for _, row in ref_sub.iterrows():
-            fig = _plot_one_gene_tss(row, tss_df, per_sample_clusters, names,
-                                     up_dis, down_dis, bidirection, y_fixed)
-            pdf.savefig(fig)
-            plt.close(fig)
+    # Prepare temp files for coolbox: per-sample BigWig, per-sample cluster BED, gene BED
+    with tempfile.TemporaryDirectory(prefix="tsspy_plottss_") as tmpdir:
+        gene_bed_path = f"{tmpdir}/genes.bed"
+        _write_gene_bed(ref, gene_bed_path)
+
+        sample_bw_plus_paths = []
+        sample_bw_minus_paths = []
+        sample_cluster_bed_paths = []
+        for sample, clu_path in zip(names, cluster_inputs):
+            bw_p = f"{tmpdir}/{sample}.plus.bw"
+            bw_m = f"{tmpdir}/{sample}.minus.bw"
+            _write_sample_bigwig(tss_df, sample, chrom_sizes, bw_p, "+", negate=False)
+            _write_sample_bigwig(tss_df, sample, chrom_sizes, bw_m, "-", negate=True)
+            sample_bw_plus_paths.append(bw_p)
+            sample_bw_minus_paths.append(bw_m)
+            clu_df = pd.read_csv(clu_path, sep="\t")
+            cb_path = f"{tmpdir}/{sample}.clusters.bed"
+            _write_clusters_bed(clu_df, cb_path)
+            sample_cluster_bed_paths.append(cb_path)
+
+        with PdfPages(str(output)) as pdf:
+            for _, row in ref_sub.iterrows():
+                fig = _plot_one_gene_coolbox(
+                    row, names, sample_bw_plus_paths, sample_bw_minus_paths,
+                    sample_cluster_bed_paths, gene_bed_path,
+                    up_dis, down_dis)
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
     typer.echo(f"Wrote {len(ref_sub)}-page TSS browser PDF to {output}")
 
 

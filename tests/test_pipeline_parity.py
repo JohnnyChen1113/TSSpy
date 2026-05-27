@@ -333,7 +333,7 @@ def test_plot_shape_smoke(workdir, data_dir):
 
 
 def test_plot_tss_smoke(workdir, data_dir):
-    """Browser-style multi-page TSS plot for selected genes."""
+    """Browser-style multi-page TSS plot for selected genes (coolbox-based)."""
     out = workdir / "tss_browser.pdf"
     run_tsspy(
         "plot", "tss",
@@ -342,6 +342,7 @@ def test_plot_tss_smoke(workdir, data_dir):
         "-c", str(data_dir / "tssr_stage5_consensus_Arrest.tsv"),
         "-n", "YPD Arrest",
         "-a", str(data_dir / "saccharomyces_cerevisiae_R64-2-1.gff"),
+        "-r", str(data_dir / "Scer.genome.fasta"),
         "--genes", "YAL003W YAL062W YBR090C",
         "-o", str(out),
     )
